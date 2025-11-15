@@ -31,6 +31,7 @@ Happy fine-tuning!
 
 import argparse
 import os
+import random
 
 
 def run(args):
@@ -105,9 +106,36 @@ def run(args):
         dataset = MsDataset.load(args.dataset, split = "train")
     else:
         # Load and format dataset
-        dataset = load_dataset(args.dataset, split = "train")
+        # Support local JSON files
+        if args.dataset.endswith('.json') or os.path.isfile(args.dataset):
+            dataset = load_dataset("json", data_files={"train": args.dataset}, split="train")
+        else:
+            dataset = load_dataset(args.dataset, split = "train")
     dataset = dataset.map(formatting_prompts_func, batched = True)
-    print("Data is formatted and ready!")
+    print("Training data is formatted and ready!")
+
+    # Load evaluation dataset if provided
+    eval_dataset = None
+    if args.eval_dataset:
+        if args.eval_dataset.endswith('.json') or os.path.isfile(args.eval_dataset):
+            eval_dataset = load_dataset("json", data_files={"train": args.eval_dataset}, split="train")
+        else:
+            eval_dataset = load_dataset(args.eval_dataset, split = "train")
+        eval_dataset = eval_dataset.map(formatting_prompts_func, batched = True)
+        print("Evaluation data is formatted and ready!")
+
+    # Configure wandb if using it
+    wandb_initialized = False
+    if args.report_to == "wandb" or (isinstance(args.report_to, list) and "wandb" in args.report_to):
+        if args.wandb_entity or args.wandb_project or args.wandb_run_name:
+            import wandb
+            wandb.init(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                resume="allow",
+            )
+            wandb_initialized = True
 
     # Configure training arguments
     training_args = SFTConfig(
@@ -128,14 +156,163 @@ def run(args):
         max_length = args.max_seq_length,
         dataset_num_proc = 2,
         packing = False,
+        # Evaluation settings
+        eval_strategy = args.eval_strategy if eval_dataset else "no",
+        eval_steps = args.eval_steps if eval_dataset and args.eval_strategy == "steps" else None,
+        per_device_eval_batch_size = args.per_device_eval_batch_size if eval_dataset else None,
+        # Checkpoint saving settings
+        save_strategy = args.save_strategy,
+        save_steps = args.save_steps if args.save_strategy == "steps" else None,
+        save_total_limit = args.save_total_limit,
     )
 
+    # Create custom callback for logging completions to wandb
+    if wandb_initialized:
+        from transformers import TrainerCallback
+        import wandb
+        
+        class CompletionsCallback(TrainerCallback):
+            def __init__(self, model, tokenizer, train_dataset, eval_dataset):
+                self.model = model
+                self.tokenizer = tokenizer
+                self.train_dataset = train_dataset
+                self.eval_dataset = eval_dataset
+                # Sample 5 datapoints from train set
+                self.train_samples = random.sample(range(len(train_dataset)), min(5, len(train_dataset))) if len(train_dataset) > 0 else []
+                # Sample datapoints from eval set
+                self.eval_samples = list(range(min(5, len(eval_dataset)))) if eval_dataset and len(eval_dataset) > 0 else []
+            
+            def _extract_instruction_and_output(self, text):
+                """Extract instruction/input and output from formatted text"""
+                # The text is formatted as: instruction + input + response
+                # We need to extract the instruction part and the output part
+                if "### Instruction:" in text and "### Response:" in text:
+                    parts = text.split("### Response:")
+                    instruction = parts[0].replace("### Instruction:", "").replace("### Input:", "").strip()
+                    output = parts[1].strip() if len(parts) > 1 else ""
+                    return instruction, output
+                return text[:200] + "..." if len(text) > 200 else text, ""
+            
+            def _generate_prediction(self, instruction_text):
+                """Generate prediction from model"""
+                try:
+                    # Extract just the instruction part (before Response)
+                    if "### Response:" in instruction_text:
+                        prompt = instruction_text.split("### Response:")[0] + "### Response:"
+                    else:
+                        prompt = instruction_text
+                    
+                    # Tokenize and generate
+                    inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=args.max_seq_length - 50).to(self.model.device)
+                    
+                    # Set model to eval mode for generation
+                    was_training = self.model.training
+                    self.model.eval()
+                    
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=100,
+                            temperature=0.7,
+                            do_sample=True,
+                            pad_token_id=self.tokenizer.eos_token_id,
+                        )
+                    
+                    # Restore training mode
+                    if was_training:
+                        self.model.train()
+                    
+                    # Decode only the new tokens
+                    generated_text = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                    return generated_text.strip()
+                except Exception as e:
+                    return f"Error: {str(e)}"
+            
+            def _log_completions_table(self, dataset, sample_indices, table_name, step):
+                """Log completions table to wandb"""
+                if not sample_indices:
+                    return
+                
+                import wandb
+                
+                table_data = []
+                for idx in sample_indices:
+                    sample = dataset[idx]
+                    text = sample.get("text", "")
+                    instruction, ground_truth = self._extract_instruction_and_output(text)
+                    
+                    # Generate prediction
+                    prediction = self._generate_prediction(text)
+                    
+                    table_data.append({
+                        "instruction": instruction[:500],  # Truncate for display
+                        "ground_truth": ground_truth[:500],
+                        "prediction": prediction[:500],
+                    })
+                
+                # Create wandb table
+                table = wandb.Table(columns=["instruction", "ground_truth", "prediction"], data=[
+                    [row["instruction"], row["ground_truth"], row["prediction"]] 
+                    for row in table_data
+                ])
+                
+                # Log to wandb
+                wandb.log({f"completions/{table_name}": table}, step=step)
+            
+            def on_train_begin(self, args, state, control, **kwargs):
+                """Log initial completions at training start"""
+                # Log initial predictions at step 0
+                if self.train_samples:
+                    self._log_completions_table(
+                        self.train_dataset, 
+                        self.train_samples, 
+                        "train", 
+                        0
+                    )
+                
+                if self.eval_samples and self.eval_dataset:
+                    self._log_completions_table(
+                        self.eval_dataset, 
+                        self.eval_samples, 
+                        "val", 
+                        0
+                    )
+            
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                """Log completions at evaluation steps"""
+                # Only log during evaluation to avoid overhead
+                if "eval_loss" in (logs or {}):
+                    # Log train completions
+                    if self.train_samples:
+                        self._log_completions_table(
+                            self.train_dataset, 
+                            self.train_samples, 
+                            "train", 
+                            state.global_step
+                        )
+                    
+                    # Log eval completions
+                    if self.eval_samples and self.eval_dataset:
+                        self._log_completions_table(
+                            self.eval_dataset, 
+                            self.eval_samples, 
+                            "val", 
+                            state.global_step
+                        )
+        
+        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset)
+        callbacks = [completions_callback]
+    else:
+        callbacks = None
+    
     # Initialize trainer
     trainer = SFTTrainer(
         model = model,
         processing_class = tokenizer,
         train_dataset = dataset,
+        eval_dataset = eval_dataset,
         args = training_args,
+        callbacks = callbacks,
     )
 
     # Train model
@@ -214,7 +391,13 @@ if __name__ == "__main__":
         "--dataset",
         type = str,
         default = "yahma/alpaca-cleaned",
-        help = "Huggingface dataset to use for training",
+        help = "Huggingface dataset or local JSON file to use for training",
+    )
+    model_group.add_argument(
+        "--eval_dataset",
+        type = str,
+        default = None,
+        help = "Huggingface dataset or local JSON file to use for evaluation (optional)",
     )
 
     lora_group = parser.add_argument_group(
@@ -309,6 +492,44 @@ if __name__ == "__main__":
         default = 3407,
         help = "Seed for reproducibility, default is 3407.",
     )
+    training_group.add_argument(
+        "--eval_strategy",
+        type = str,
+        default = "steps",
+        choices = ["no", "steps", "epoch"],
+        help = "Evaluation strategy: 'no', 'steps', or 'epoch'. Default is 'steps'.",
+    )
+    training_group.add_argument(
+        "--eval_steps",
+        type = int,
+        default = 100,
+        help = "Run evaluation every N steps. Only used if eval_strategy='steps'. Default is 100.",
+    )
+    training_group.add_argument(
+        "--per_device_eval_batch_size",
+        type = int,
+        default = 2,
+        help = "Batch size per device for evaluation. Default is 2.",
+    )
+    training_group.add_argument(
+        "--save_strategy",
+        type = str,
+        default = "steps",
+        choices = ["no", "steps", "epoch"],
+        help = "Checkpoint saving strategy: 'no', 'steps', or 'epoch'. Default is 'steps'.",
+    )
+    training_group.add_argument(
+        "--save_steps",
+        type = int,
+        default = 500,
+        help = "Save checkpoint every N steps. Only used if save_strategy='steps'. Default is 500.",
+    )
+    training_group.add_argument(
+        "--save_total_limit",
+        type = int,
+        default = 3,
+        help = "Limit the total number of checkpoints. Older checkpoints are deleted. Default is 3.",
+    )
 
     # Report/Logging arguments
     report_group = parser.add_argument_group("📊 Report Options")
@@ -335,6 +556,24 @@ if __name__ == "__main__":
     )
     report_group.add_argument(
         "--logging_steps", type = int, default = 1, help = "Logging steps, default is 1"
+    )
+    report_group.add_argument(
+        "--wandb_entity",
+        type = str,
+        default = None,
+        help = "Wandb entity (username or team name). If not set, uses default from wandb config.",
+    )
+    report_group.add_argument(
+        "--wandb_project",
+        type = str,
+        default = None,
+        help = "Wandb project name. If not set, uses default from wandb config.",
+    )
+    report_group.add_argument(
+        "--wandb_run_name",
+        type = str,
+        default = None,
+        help = "Wandb run name. If not set, wandb auto-generates a name.",
     )
 
     # Saving and pushing arguments

@@ -175,3 +175,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .vscode
+
+# Outputs
+Models/
+wandb/
+data/
