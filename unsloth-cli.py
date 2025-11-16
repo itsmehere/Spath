@@ -278,27 +278,26 @@ def run(args):
                         0
                     )
             
-            def on_log(self, args, state, control, logs=None, **kwargs):
-                """Log completions at evaluation steps"""
-                # Only log during evaluation to avoid overhead
-                if "eval_loss" in (logs or {}):
-                    # Log train completions
-                    if self.train_samples:
-                        self._log_completions_table(
-                            self.train_dataset, 
-                            self.train_samples, 
-                            "train", 
-                            state.global_step
-                        )
-                    
-                    # Log eval completions
-                    if self.eval_samples and self.eval_dataset:
-                        self._log_completions_table(
-                            self.eval_dataset, 
-                            self.eval_samples, 
-                            "val", 
-                            state.global_step
-                        )
+            def on_evaluate(self, args, state, control, logs=None, **kwargs):
+                """Log completions when evaluation actually runs"""
+                # This callback is only called during actual evaluation
+                # Log train completions
+                if self.train_samples:
+                    self._log_completions_table(
+                        self.train_dataset, 
+                        self.train_samples, 
+                        "train", 
+                        state.global_step
+                    )
+                
+                # Log eval completions
+                if self.eval_samples and self.eval_dataset:
+                    self._log_completions_table(
+                        self.eval_dataset, 
+                        self.eval_samples, 
+                        "val", 
+                        state.global_step
+                    )
         
         completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset)
         callbacks = [completions_callback]
