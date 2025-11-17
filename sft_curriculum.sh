@@ -31,7 +31,7 @@ echo "Each curriculum stage will be seen EXACTLY ONCE"
 echo ""
 
 # Single GPU training with 4-bit quantization
-python unsloth-cli.py \
+python unsloth-cli-aaryan.py \
     --model_name "unsloth/Qwen3-4B" \
     --max_seq_length 2048 \
     --load_in_4bit \
