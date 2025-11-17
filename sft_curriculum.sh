@@ -12,15 +12,15 @@ export CUDA_VISIBLE_DEVICES=0
 
 echo "========================================"
 echo "CURRICULUM LEARNING TRAINING"
-echo "Stage 1: 3-4 nodes (15K samples)"
-echo "Stage 2: 5-6 nodes (15K samples)"  
-echo "Stage 3: 7-8 nodes (20K samples)"
-echo "Stage 4: 9-10 nodes (20K samples)"
+echo "Stage 1: 3-4 nodes (5K samples) - Easiest"
+echo "Stage 2: 5-6 nodes (10K samples)"  
+echo "Stage 3: 7-8 nodes (10K samples)"
+echo "Stage 4: 9-10 nodes (15K samples)"
 echo "Stage 5: 11-12 nodes (15K samples)"
-echo "Stage 6: 13-15 nodes (15K samples)"
-echo "Total: 100K samples, 3→15 nodes"
-echo "Training: 98,000 samples | Validation: 2,000 samples"
-echo "Max steps: 6,125 (1 epoch = 6,125 steps with batch size 16)"
+echo "Stage 6: 13-15 nodes (25K samples) - Hardest"
+echo "Total: 80K samples, 3→15 nodes"
+echo "Training: 78,400 samples | Validation: 1,600 samples"
+echo "Max steps: 4,900 (1 epoch = 4,900 steps with batch size 16)"
 echo "Eval: Every 100 steps (2 samples per stage = 12 total per eval)"
 echo "========================================"
 echo ""
@@ -46,14 +46,14 @@ python unsloth-cli.py \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 4 \
     --warmup_steps 100 \
-    --max_steps 6125 \
+    --max_steps 4900 \
     --learning_rate 2e-4 \
     --optim "adamw_8bit" \
     --weight_decay 0.01 \
     --lr_scheduler_type "cosine" \
     --output_dir "Models_curriculum" \
     --save_strategy "steps" \
-    --save_steps 1000 \
+    --save_steps 800 \
     --save_total_limit 3 \
     --report_to "wandb" \
     --wandb_entity "spath" \

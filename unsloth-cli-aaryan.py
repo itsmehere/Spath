@@ -221,7 +221,7 @@ def run(args):
                 self.eval_dataset = eval_dataset
                 
                 # Calculate stage boundaries dynamically based on actual dataset size
-                # Stage distribution: 15% / 15% / 20% / 20% / 15% / 15%
+                # Stage distribution: 5K/10K/10K/15K/15K/25K = 6.25% / 12.5% / 12.5% / 18.75% / 18.75% / 31.25%
                 train_len = len(train_dataset) if train_dataset else 0
                 eval_len = len(eval_dataset) if eval_dataset else 0
                 
@@ -230,8 +230,10 @@ def run(args):
                 print(f"   Eval dataset size: {eval_len}")
                 
                 # Calculate boundaries based on actual dataset sizes
-                self.train_stage_boundaries = self._calculate_stage_boundaries(train_len, [0.15, 0.15, 0.20, 0.20, 0.15, 0.15])
-                self.eval_stage_boundaries = self._calculate_stage_boundaries(eval_len, [0.15, 0.15, 0.20, 0.20, 0.15, 0.15])
+                # Proportions: 5K/80K, 10K/80K, 10K/80K, 15K/80K, 15K/80K, 25K/80K
+                stage_proportions = [0.0625, 0.125, 0.125, 0.1875, 0.1875, 0.3125]
+                self.train_stage_boundaries = self._calculate_stage_boundaries(train_len, stage_proportions)
+                self.eval_stage_boundaries = self._calculate_stage_boundaries(eval_len, stage_proportions)
                 
                 print(f"   Train stage boundaries: {self.train_stage_boundaries}")
                 print(f"   Eval stage boundaries: {self.eval_stage_boundaries}")
@@ -327,7 +329,7 @@ def run(args):
                     with torch.no_grad():
                         outputs = self.model.generate(
                             **inputs,
-                            max_new_tokens=128,
+                            max_new_tokens=2048,
                             temperature=0.7,
                             do_sample=True,
                             pad_token_id=self.tokenizer.eos_token_id,

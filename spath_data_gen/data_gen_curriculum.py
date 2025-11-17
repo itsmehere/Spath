@@ -11,15 +11,15 @@ from pathlib import Path
 # ============================================================================
 
 # Dataset generation parameters for curriculum learning
-# Total: 100K samples split across 6 stages from 3 to 15 nodes
-# Distribution: 15% / 15% / 20% / 20% / 15% / 15%
+# Total: 80K samples split across 6 stages from 3 to 15 nodes
+# Distribution: More samples for harder stages (5K / 10K / 10K / 15K / 15K / 25K)
 CURRICULUM_STAGES = [
-    {"num_nodes": [3, 4], "samples": 15000, "name": "stage1_baby"},        # 15K samples, 3-4 nodes (15%)
-    {"num_nodes": [5, 6], "samples": 15000, "name": "stage2_easy"},        # 15K samples, 5-6 nodes (15%)
-    {"num_nodes": [7, 8], "samples": 20000, "name": "stage3_medium"},      # 20K samples, 7-8 nodes (20%)
-    {"num_nodes": [9, 10], "samples": 20000, "name": "stage4_hard"},       # 20K samples, 9-10 nodes (20%)
-    {"num_nodes": [11, 12], "samples": 15000, "name": "stage5_harder"},    # 15K samples, 11-12 nodes (15%)
-    {"num_nodes": [13, 14, 15], "samples": 15000, "name": "stage6_expert"},# 15K samples, 13-15 nodes (15%)
+    {"num_nodes": [3, 4], "samples": 5000, "name": "stage1_baby"},         # 5K samples, 3-4 nodes (easiest)
+    {"num_nodes": [5, 6], "samples": 10000, "name": "stage2_easy"},        # 10K samples, 5-6 nodes
+    {"num_nodes": [7, 8], "samples": 10000, "name": "stage3_medium"},      # 10K samples, 7-8 nodes
+    {"num_nodes": [9, 10], "samples": 15000, "name": "stage4_hard"},       # 15K samples, 9-10 nodes
+    {"num_nodes": [11, 12], "samples": 15000, "name": "stage5_harder"},     # 15K samples, 11-12 nodes
+    {"num_nodes": [13, 14, 15], "samples": 25000, "name": "stage6_expert"},# 25K samples, 13-15 nodes (hardest)
 ]
 
 SEED = 182
