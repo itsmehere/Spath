@@ -454,7 +454,15 @@ def run(args):
                         0
                     )
                 
-                if self.eval_samples and self.eval_dataset:
+                # Log eval completions at step 0 (use eval_all_indices if available, otherwise eval_samples)
+                if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
+                    self._log_completions_table(
+                        self.eval_dataset, 
+                        self.eval_all_indices, 
+                        "val", 
+                        0
+                    )
+                elif self.eval_samples and self.eval_dataset:
                     self._log_completions_table(
                         self.eval_dataset, 
                         self.eval_samples, 
@@ -474,12 +482,20 @@ def run(args):
                         state.global_step
                     )
                 
-                # Log eval completions (limited to 50 samples) - this is the main val table
+                # Log eval completions (limited to 25 samples) - this is the main val table
                 if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
-                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions to wandb (limited to 50)...")
+                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions to wandb (limited to 25)...")
                     self._log_completions_table(
                         self.eval_dataset, 
                         self.eval_all_indices, 
+                        "val", 
+                        state.global_step
+                    )
+                elif self.eval_samples and self.eval_dataset:
+                    # Fallback if eval_all_indices not available
+                    self._log_completions_table(
+                        self.eval_dataset, 
+                        self.eval_samples, 
                         "val", 
                         state.global_step
                     )

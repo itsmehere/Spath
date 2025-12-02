@@ -46,7 +46,7 @@ python unsloth-cli-curriculum-icl.py \
     --gradient_accumulation_steps 4 \
     --warmup_steps 100 \
     --max_steps 404 \
-    --learning_rate 2e-4 \
+    --learning_rate 4e-5 \
     --optim "adamw_8bit" \
     --output_dir "Models" \
     --save_strategy "steps" \
