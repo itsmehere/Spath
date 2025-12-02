@@ -32,6 +32,8 @@ Happy fine-tuning!
 import argparse
 import os
 import random
+import json
+import re
 
 
 def run(args):
@@ -186,29 +188,34 @@ def run(args):
                         has_curriculum = True
                 
                 if has_curriculum:
-                    # Sample from each curriculum stage (2 per stage for train, 5 per stage for eval)
+                    # Sample from each curriculum stage (25 per stage for both train and eval)
                     print("\n📊 Sampling completions for curriculum stages:")
                     print("   Training set:")
-                    self.train_samples = self._sample_from_curriculum_stages(train_dataset, samples_per_stage=2)
+                    self.train_samples = self._sample_from_curriculum_stages(train_dataset, samples_per_stage=25)
                     if eval_dataset and len(eval_dataset) > 0:
-                        print("   Validation set (sampling for preview):")
-                        self.eval_samples = self._sample_from_curriculum_stages(eval_dataset, samples_per_stage=5)
-                        # Store all eval indices for full logging
-                        self.eval_all_indices = list(range(len(eval_dataset)))
-                        print(f"   Will log ALL {len(self.eval_all_indices)} eval completions during evaluation")
+                        print("   Validation set:")
+                        # Store only first 25 eval indices for evaluation
+                        eval_limit = min(25, len(eval_dataset))
+                        self.eval_all_indices = list(range(eval_limit))
+                        print(f"   Will log {len(self.eval_all_indices)} eval completions during evaluation (limited to 25)")
+                        # No separate preview samples needed
+                        self.eval_samples = []
                     else:
                         self.eval_samples = []
                         self.eval_all_indices = []
-                    print(f"   Total: {len(self.train_samples)} train samples, {len(self.eval_samples)} eval preview samples\n")
+                    print(f"   Total: {len(self.train_samples)} train samples, {len(self.eval_all_indices) if hasattr(self, 'eval_all_indices') else 0} eval samples\n")
                 else:
                     # Fallback: Sample 5 datapoints from train set
                     self.train_samples = random.sample(range(len(train_dataset)), min(5, len(train_dataset))) if len(train_dataset) > 0 else []
                     # Sample datapoints from eval set
                     self.eval_samples = list(range(min(5, len(eval_dataset)))) if eval_dataset and len(eval_dataset) > 0 else []
-                    # Store all eval indices for full logging
-                    self.eval_all_indices = list(range(len(eval_dataset))) if eval_dataset and len(eval_dataset) > 0 else []
-                    if self.eval_all_indices:
-                        print(f"   Will log ALL {len(self.eval_all_indices)} eval completions during evaluation")
+                    # Store only first 50 eval indices for evaluation (instead of all)
+                    if eval_dataset and len(eval_dataset) > 0:
+                        eval_limit = min(50, len(eval_dataset))
+                        self.eval_all_indices = list(range(eval_limit))
+                        print(f"   Will log {len(self.eval_all_indices)} eval completions during evaluation (limited to 50)")
+                    else:
+                        self.eval_all_indices = []
             
             def _sample_from_curriculum_stages(self, dataset, samples_per_stage=2):
                 """Sample examples from each curriculum stage"""
@@ -249,57 +256,152 @@ def run(args):
                     return instruction, output
                 return text
             
-            def _generate_prediction(self, instruction_text):
-                """Generate prediction from model"""
+            def _parse_path_from_output(self, text):
+                """Parse shortest path from model output"""
+                # Try to find JSON array format [0, 1, 2]
+                match = re.search(r'\[([-\d,\s]+)\]', text)
+                if match:
+                    try:
+                        numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
+                        return numbers
+                    except ValueError:
+                        pass
+                # Try to find in "Final Answer" format
+                if "Final Answer" in text or "shortest path" in text.lower():
+                    match = re.search(r'\[([-\d,\s]+)\]', text)
+                    if match:
+                        try:
+                            numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
+                            return numbers
+                        except ValueError:
+                            pass
+                return None
+            
+            def _extract_ground_truth_path(self, output_text):
+                """Extract ground truth shortest path from output text"""
+                # Look for "Final Answer: The shortest path ... is [0, 1, 2]"
+                match = re.search(r'is\s+(\[[\d,\s]+\])', output_text)
+                if match:
+                    try:
+                        path = json.loads(match.group(1))
+                        if isinstance(path, list):
+                            return path
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                # Try to find any JSON array
+                match = re.search(r'\[([\d,\s]+)\]', output_text)
+                if match:
+                    try:
+                        numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
+                        return numbers
+                    except ValueError:
+                        pass
+                return None
+            
+            def _generate_prediction_batch(self, instruction_texts):
+                """Generate predictions for multiple prompts in batch (much faster)"""
                 try:
-                    # Extract just the instruction part (before Response)
-                    if "### Response:" in instruction_text:
-                        prompt = instruction_text.split("### Response:")[0] + "### Response:"
-                    else:
-                        prompt = instruction_text
+                    # Extract just the instruction part (before Response) for each prompt
+                    prompts = []
+                    for instruction_text in instruction_texts:
+                        if "### Response:" in instruction_text:
+                            prompt = instruction_text.split("### Response:")[0] + "### Response:"
+                        else:
+                            prompt = instruction_text
+                        prompts.append(prompt)
                     
-                    # Tokenize and generate
-                    inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=args.max_seq_length - 50).to(self.model.device)
+                    # Tokenize all prompts at once (batch processing)
+                    inputs = self.tokenizer(
+                        prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=args.max_seq_length - 50
+                    ).to(self.model.device)
                     
                     # Set model to eval mode for generation
                     was_training = self.model.training
                     self.model.eval()
                     
+                    pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                    eos_token_id = self.tokenizer.eos_token_id
+                    
                     with torch.no_grad():
                         outputs = self.model.generate(
                             **inputs,
-                            max_new_tokens=2048,
-                            temperature=0.7,
-                            do_sample=True,
-                            pad_token_id=self.tokenizer.eos_token_id,
-                            eos_token_id=self.tokenizer.eos_token_id,
+                            max_new_tokens=256,  # Reduced from 2048 - much faster, sufficient for path + reasoning
+                            do_sample=False,  # Greedy decoding - much faster than sampling
+                            pad_token_id=pad_token_id,
+                            eos_token_id=eos_token_id,
                         )
                     
                     # Restore training mode
                     if was_training:
                         self.model.train()
                     
-                    # Decode only the new tokens
-                    generated_text = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-                    return generated_text.strip()
+                    # Decode all outputs
+                    generated_texts = []
+                    input_lengths = inputs['input_ids'].shape[1]
+                    for i, output in enumerate(outputs):
+                        # Decode only the new tokens (skip the prompt)
+                        generated_text = self.tokenizer.decode(
+                            output[input_lengths:], 
+                            skip_special_tokens=True
+                        )
+                        generated_texts.append(generated_text.strip())
+                    
+                    return generated_texts
                 except Exception as e:
-                    return f"Error: {str(e)}"
+                    # Return error for all if batch fails
+                    return [f"Error: {str(e)}"] * len(instruction_texts)
+            
+            def _generate_prediction(self, instruction_text):
+                """Generate prediction for single prompt (backward compatibility)"""
+                results = self._generate_prediction_batch([instruction_text])
+                return results[0] if results else "Error: Generation failed"
             
             def _log_completions_table(self, dataset, sample_indices, table_name, step):
-                """Log completions table to wandb"""
+                """Log completions table to wandb with accuracy calculation"""
                 if not sample_indices:
                     return
                 
                 import wandb
                 
-                table_data = []
+                # Prepare all samples for batch generation
+                all_texts = []
+                all_samples = []
                 for idx in sample_indices:
                     sample = dataset[idx]
                     text = sample.get("text", "")
-                    instruction, ground_truth = self._extract_instruction_and_output(text)
+                    all_texts.append(text)
+                    all_samples.append((idx, sample))
+                
+                # Generate predictions in batch (much faster!)
+                print(f"   Generating {len(all_texts)} predictions in batch...")
+                prediction_texts = self._generate_prediction_batch(all_texts)
+                
+                # Process results
+                table_data = []
+                correct_count = 0
+                total_count = len(sample_indices)
+                
+                for (idx, sample), prediction_text in zip(all_samples, prediction_texts):
+                    text = sample.get("text", "")
+                    instruction, ground_truth_text = self._extract_instruction_and_output(text)
                     
-                    # Generate prediction
-                    prediction = self._generate_prediction(text)
+                    # Extract ground truth path from output text
+                    ground_truth_path = self._extract_ground_truth_path(ground_truth_text)
+                    
+                    # Parse predicted path from model output
+                    predicted_path = self._parse_path_from_output(prediction_text)
+                    
+                    # Check if prediction matches ground truth
+                    is_correct = (predicted_path is not None and 
+                                ground_truth_path is not None and 
+                                predicted_path == ground_truth_path)
+                    
+                    if is_correct:
+                        correct_count += 1
                     
                     # Get curriculum stage if available
                     stage = None
@@ -310,19 +412,36 @@ def run(args):
                     table_data.append({
                         "stage": stage_name,
                         "sample_idx": idx,
-                        "instruction": instruction,  # No truncation - display full text
-                        "ground_truth": ground_truth,
-                        "prediction": prediction,
+                        "instruction": instruction,  # No truncation - show full text
+                        "ground_truth_path": str(ground_truth_path) if ground_truth_path else "N/A",
+                        "predicted_path": str(predicted_path) if predicted_path else "N/A",
+                        "ground_truth_text": ground_truth_text,  # No truncation - show full text
+                        "prediction_text": prediction_text,  # No truncation - show full text
+                        "correct": is_correct,
                     })
                 
-                # Create wandb table with stage information
-                table = wandb.Table(columns=["stage", "sample_idx", "instruction", "ground_truth", "prediction"], data=[
-                    [row["stage"], row["sample_idx"], row["instruction"], row["ground_truth"], row["prediction"]] 
-                    for row in table_data
-                ])
+                # Calculate accuracy
+                accuracy = (correct_count / total_count * 100) if total_count > 0 else 0.0
                 
-                # Log to wandb
-                wandb.log({f"completions/{table_name}": table}, step=step)
+                # Create wandb table with accuracy information
+                table = wandb.Table(
+                    columns=["stage", "sample_idx", "ground_truth_path", "predicted_path", "correct", "instruction", "ground_truth_text", "prediction_text"], 
+                    data=[
+                        [row["stage"], row["sample_idx"], row["ground_truth_path"], row["predicted_path"], 
+                         row["correct"], row["instruction"], row["ground_truth_text"], row["prediction_text"]] 
+                        for row in table_data
+                    ]
+                )
+                
+                # Log table and accuracy to wandb
+                wandb.log({
+                    f"completions/{table_name}": table,
+                    f"accuracy/{table_name}": accuracy,
+                    f"accuracy/{table_name}_count": f"{correct_count}/{total_count}",
+                }, step=step)
+                
+                # Print accuracy to console
+                print(f"\n📊 {table_name.upper()} Accuracy: {correct_count}/{total_count} = {accuracy:.2f}%")
             
             def on_train_begin(self, args, state, control, **kwargs):
                 """Log initial completions at training start"""
@@ -355,20 +474,12 @@ def run(args):
                         state.global_step
                     )
                 
-                # Log ALL eval completions (not just sampled ones)
+                # Log eval completions (limited to 50 samples) - this is the main val table
                 if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
-                    print(f"\n📊 Logging ALL {len(self.eval_all_indices)} eval completions to wandb...")
+                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions to wandb (limited to 50)...")
                     self._log_completions_table(
                         self.eval_dataset, 
                         self.eval_all_indices, 
-                        "val_all", 
-                        state.global_step
-                    )
-                # Also log preview samples for quick reference
-                elif self.eval_samples and self.eval_dataset:
-                    self._log_completions_table(
-                        self.eval_dataset, 
-                        self.eval_samples, 
                         "val", 
                         state.global_step
                     )

@@ -17,12 +17,11 @@ from pathlib import Path
 # ============================================================================
 
 # Curriculum stages for few-shot training
+# Modified: Size 3, 4, and 5 nodes (5K samples each)
 CURRICULUM_STAGES = [
-    {"num_nodes": [3], "samples": 5000, "name": "stage1_baby"},         # 5K samples, 3 nodes (easiest)
-    {"num_nodes": [4], "samples": 10000, "name": "stage2_easy"},        # 10K samples, 4 nodes
-    {"num_nodes": [5], "samples": 10000, "name": "stage3_medium"},      # 10K samples, 5 nodes
-    {"num_nodes": [6], "samples": 15000, "name": "stage4_hard"},       # 15K samples, 6 nodes
-    {"num_nodes": [7], "samples": 15000, "name": "stage5_harder"},     # 15K samples, 7 nodes (hardest)
+    {"num_nodes": [3], "samples": 5000, "name": "stage1_baby"},         # 5K samples, 3 nodes
+    {"num_nodes": [4], "samples": 5000, "name": "stage2_easy"},        # 5K samples, 4 nodes
+    {"num_nodes": [5], "samples": 5000, "name": "stage3_medium"},      # 5K samples, 5 nodes
 ]
 
 SEED = 182
@@ -296,9 +295,14 @@ def generate_curriculum_fewshot_dataset():
     print(f"{'='*80}\n")
     
     # Split into train and val WHILE PRESERVING CURRICULUM ORDER
+    # This ensures train and val are completely separate (no overlap)
     split_idx = int(len(all_datapoints) * TRAIN_SPLIT)
     train_datapoints = all_datapoints[:split_idx]
     val_datapoints = all_datapoints[split_idx:]
+    
+    # Verify all datapoints are size 3, 4, or 5 (curriculum stages)
+    for dp in train_datapoints + val_datapoints:
+        assert dp['num_nodes'] in [3, 4, 5], f"Expected all graphs to be size 3, 4, or 5, but found size {dp['num_nodes']}"
     
     # Group into batches of 5 (4 examples + 1 query) per stage
     def create_batches(datapoints: List[dict]) -> List[dict]:
