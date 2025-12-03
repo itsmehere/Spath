@@ -176,13 +176,14 @@ def run(args):
         import wandb
         
         class CompletionsCallback(TrainerCallback):
-            def __init__(self, model, tokenizer, train_dataset, eval_dataset):
+            def __init__(self, model, tokenizer, train_dataset, eval_dataset, eval_steps=25):
                 self.model = model
                 self.tokenizer = tokenizer
                 self.train_dataset = train_dataset
                 self.eval_dataset = eval_dataset
                 self.logged_steps = set()  # Track which steps we've already logged to avoid duplicates
                 self.trainer = None  # Will be set in on_train_begin
+                self.eval_steps = eval_steps  # Store eval_steps from command-line args
                 
                 # Check if dataset has curriculum_stage field
                 has_curriculum = False
@@ -286,16 +287,28 @@ def run(args):
                 return text
             
             def _parse_path_from_output(self, text):
-                """Parse shortest path from model output - uses LAST set of brackets found"""
-                # Find ALL matches of bracket patterns [0, 1, 2]
-                all_matches = re.findall(r'\[([-\d,\s]+)\]', text)
+                """Parse shortest path from model output - looks for brackets after 'Final Answer'"""
+                # Find "Final Answer" (case insensitive) and extract first brackets after it
+                final_answer_idx = text.lower().find("final answer")
+                if final_answer_idx != -1:
+                    # Look for brackets in the text starting from "Final Answer"
+                    remaining_text = text[final_answer_idx:]
+                    bracket_match = re.search(r'\[([-\d,\s]+)\]', remaining_text)
+                    if bracket_match:
+                        try:
+                            numbers = [int(item.strip()) for item in bracket_match.group(1).split(",") if item.strip()]
+                            # Only return if it looks like a valid path (at least 2 nodes)
+                            if len(numbers) >= 2:
+                                return numbers
+                        except ValueError:
+                            pass
                 
+                # Fallback: use last set of brackets (backward compatibility)
+                all_matches = re.findall(r'\[([-\d,\s]+)\]', text)
                 if all_matches:
-                    # Use the LAST match (most likely the final answer)
                     last_match = all_matches[-1]
                     try:
                         numbers = [int(item.strip()) for item in last_match.split(",") if item.strip()]
-                        # Only return if it looks like a valid path (at least 2 nodes)
                         if len(numbers) >= 2:
                             return numbers
                     except ValueError:
@@ -565,10 +578,8 @@ def run(args):
                     self.trainer = kwargs.get("trainer")
                 
                 # Check if this is an evaluation step (every eval_steps, or step 0)
-                # Use the eval_steps from training args (default 25)
-                eval_steps = 25  # Default, matches --eval_steps 25 in script
-                if hasattr(args, 'eval_steps') and args.eval_steps:
-                    eval_steps = args.eval_steps
+                # Use the eval_steps stored in callback (from command-line args)
+                eval_steps = self.eval_steps
                 
                 # Only run evaluation at step 0 and every eval_steps
                 if state.global_step % eval_steps != 0 and state.global_step != 0:
@@ -622,7 +633,7 @@ def run(args):
                 """This won't be called since eval_strategy='no', but kept for compatibility"""
                 pass
         
-        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset)
+        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset, eval_steps=args.eval_steps if hasattr(args, 'eval_steps') and args.eval_steps else 25)
         callbacks = [completions_callback]
     else:
         callbacks = None

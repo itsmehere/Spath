@@ -214,7 +214,7 @@ def build_fewshot_batch_prompt(batch: List[dict], num_nodes: int) -> dict:
         f"Find the shortest path from node {query['start_node']} to node {query['end_node']}.\n"
         "Nodes are indexed from 0.\n"
         "Use Dijkstra's algorithm to compute the shortest path for the question graph.\n"
-        "Answer: Provide the correct shortest path for the question graph."
+        "You must end your response with 'Final Answer: [path] with a total distance of [total]' where [path] is the shortest path as a list of node indices and [total] is the total distance."
     )
     
     prompt_text = "\n".join(parts)
@@ -225,14 +225,11 @@ def build_fewshot_batch_prompt(batch: List[dict], num_nodes: int) -> dict:
         output_text = (
             f"I'll find the shortest path using Dijkstra's algorithm:\n\n"
             f"{reasoning_text}\n\n"
-            f"Final Answer: The shortest path from node {query['start_node']} "
-            f"to node {query['end_node']} is {json.dumps(query.get('shortest_path', []))} "
-            f"with total distance {query.get('total_distance', 'unknown')}."
+            f"Final Answer: {json.dumps(query.get('shortest_path', []))} with a total distance of {query.get('total_distance', 'unknown')}."
         )
     else:
         output_text = (
-            f"Shortest path: {json.dumps(query.get('shortest_path', []))}\n"
-            f"Total distance: {query.get('total_distance', 'unknown')}"
+            f"Final Answer: {json.dumps(query.get('shortest_path', []))} with a total distance of {query.get('total_distance', 'unknown')}."
         )
     
     return {
