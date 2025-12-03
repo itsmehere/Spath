@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate curriculum learning dataset with few-shot format (4 examples + 1 query per batch).
+Generate curriculum learning dataset with few-shot format (1 example + 1 query per batch).
 Includes Dijkstra's algorithm reasoning in the output.
+The prompt structure clarifies that the first part is an example, followed by a question to solve.
 """
 
 import json
@@ -17,11 +18,12 @@ from pathlib import Path
 # ============================================================================
 
 # Curriculum stages for few-shot training
-# Modified: Size 3, 4, and 5 nodes (5K samples each)
+# Training: Only sizes 3 and 4 (4x prompts each = 40K samples each)
+# Evaluation: Still includes sizes 3, 4, 5, 6 for comprehensive evaluation
 CURRICULUM_STAGES = [
-    {"num_nodes": [3], "samples": 5000, "name": "stage1_baby"},         # 5K samples, 3 nodes
-    {"num_nodes": [4], "samples": 5000, "name": "stage2_easy"},        # 5K samples, 4 nodes
-    {"num_nodes": [5], "samples": 5000, "name": "stage3_medium"},      # 5K samples, 5 nodes
+    {"num_nodes": [3], "samples": 40000, "name": "stage1_baby"},         # 40K samples, 3 nodes (4x original)
+    {"num_nodes": [4], "samples": 40000, "name": "stage2_easy"},        # 40K samples, 4 nodes (4x original)
+    # Note: Sizes 5 and 6 are NOT in training curriculum, but will be in eval dataset
 ]
 
 SEED = 182
@@ -35,7 +37,7 @@ MIN_WEIGHT = 1
 MAX_WEIGHT = 10
 
 # Few-shot configuration
-GRAPHS_PER_BATCH = 5  # 4 examples + 1 query
+GRAPHS_PER_BATCH = 2  # 1 example + 1 query
 
 PRINT_PROGRESS_INTERVAL = 1000
 USE_CHAIN_OF_THOUGHT = True
@@ -169,44 +171,50 @@ def generate_datapoint(num_nodes: int, curriculum_stage: str) -> dict:
 
 
 def build_fewshot_batch_prompt(batch: List[dict], num_nodes: int) -> dict:
-    """Build a few-shot prompt with 4 examples + 1 query, including Dijkstra reasoning."""
+    """Build a few-shot prompt with 1 example + 1 query, including Dijkstra reasoning."""
     if len(batch) < GRAPHS_PER_BATCH:
         raise ValueError(f"Expected {GRAPHS_PER_BATCH} graphs per batch, got {len(batch)}")
     
     parts = []
     
-    # Add 4 examples with answers
-    for idx, example in enumerate(batch[:4]):
-        adjacency = json.dumps(example["adjacency_matrix"])
+    # Add header to clarify structure
+    parts.append("Below is an example. Later, you will be asked to solve a similar problem.\n")
+    
+    # Add 1 example with answer
+    example = batch[0]
+    adjacency = json.dumps(example["adjacency_matrix"])
+    parts.append(
+        f"Example:\n"
+        f"Graph representation: {adjacency}\n"
+        f"Find the shortest path from node {example['start_node']} to node {example['end_node']}.\n"
+        "Nodes are indexed from 0.\n"
+    )
+    
+    # Add Dijkstra reasoning for the example
+    if USE_CHAIN_OF_THOUGHT and example.get('reasoning_steps'):
+        reasoning_text = "\n".join(example['reasoning_steps'])
         parts.append(
-            f"Example {idx + 1}:\n"
-            f"Graph representation: {adjacency}\n"
-            f"Find the shortest path from node {example['start_node']} to node {example['end_node']}.\n"
-            "Nodes are indexed from 0.\n"
-        )
-        
-        # Add Dijkstra reasoning for examples
-        if USE_CHAIN_OF_THOUGHT and example.get('reasoning_steps'):
-            reasoning_text = "\n".join(example['reasoning_steps'])
-            parts.append(
-                f"I'll find the shortest path using Dijkstra's algorithm:\n\n"
-                f"{reasoning_text}\n\n"
-            )
-        
-        parts.append(
-            f"Answer: {json.dumps(example.get('shortest_path', []))}\n"
+            f"I'll find the shortest path using Dijkstra's algorithm:\n\n"
+            f"{reasoning_text}\n\n"
         )
     
-    # Add query (5th example) without answer
-    query = batch[4]
+    parts.append(
+        f"Answer: {json.dumps(example.get('shortest_path', []))}\n"
+    )
+    
+    # Add separator to clarify that next is the question
+    parts.append("\nNow, here is a question for you to solve:\n")
+    
+    # Add query (2nd example) without answer
+    query = batch[1]
     adjacency = json.dumps(query["adjacency_matrix"])
     parts.append(
-        f"Example 5:\n"
+        f"Question:\n"
         f"Graph representation: {adjacency}\n"
         f"Find the shortest path from node {query['start_node']} to node {query['end_node']}.\n"
         "Nodes are indexed from 0.\n"
-        "Use Dijkstra's algorithm to compute the shortest path for the query graph.\n"
-        "Answer: Provide the correct shortest path for the query graph."
+        "Use Dijkstra's algorithm to compute the shortest path for the question graph.\n"
+        "Answer: Provide the correct shortest path for the question graph."
     )
     
     prompt_text = "\n".join(parts)
@@ -247,7 +255,7 @@ def generate_curriculum_fewshot_dataset():
     print(f"Generating curriculum few-shot dataset with {len(CURRICULUM_STAGES)} stages...")
     print(f"Configuration: edge_prob={EDGE_PROBABILITY}, weights={MIN_WEIGHT}-{MAX_WEIGHT}")
     print(f"Chain-of-thought: {USE_CHAIN_OF_THOUGHT}")
-    print(f"Graphs per batch: {GRAPHS_PER_BATCH} (4 examples + 1 query)\n")
+    print(f"Graphs per batch: {GRAPHS_PER_BATCH} (1 example + 1 query)\n")
     
     # Generate data for each curriculum stage
     for stage_idx, stage in enumerate(CURRICULUM_STAGES):
@@ -294,17 +302,103 @@ def generate_curriculum_fewshot_dataset():
     print(f"TOTAL: Generated {total_samples} unique datapoints across all stages")
     print(f"{'='*80}\n")
     
-    # Split into train and val WHILE PRESERVING CURRICULUM ORDER
-    # This ensures train and val are completely separate (no overlap)
-    split_idx = int(len(all_datapoints) * TRAIN_SPLIT)
-    train_datapoints = all_datapoints[:split_idx]
-    val_datapoints = all_datapoints[split_idx:]
+    # Generate additional eval-only stages (5 and 6) for comprehensive evaluation
+    # These are NOT in training curriculum, but needed for evaluation
+    EVAL_ONLY_STAGES = [
+        {"num_nodes": [5], "samples": 10000, "name": "stage3_medium"},      # 10K samples, 5 nodes (eval only)
+        {"num_nodes": [6], "samples": 10000, "name": "stage4_hard"},        # 10K samples, 6 nodes (eval only)
+    ]
     
-    # Verify all datapoints are size 3, 4, or 5 (curriculum stages)
-    for dp in train_datapoints + val_datapoints:
-        assert dp['num_nodes'] in [3, 4, 5], f"Expected all graphs to be size 3, 4, or 5, but found size {dp['num_nodes']}"
+    print(f"\n{'='*80}")
+    print("GENERATING EVAL-ONLY STAGES (5 and 6 nodes)")
+    print("These are NOT in training curriculum, but needed for evaluation")
+    print(f"{'='*80}\n")
     
-    # Group into batches of 5 (4 examples + 1 query) per stage
+    eval_only_datapoints = []
+    for stage_idx, stage in enumerate(EVAL_ONLY_STAGES):
+        stage_name = stage["name"]
+        num_nodes_list = stage["num_nodes"]
+        target_samples = stage["samples"]
+        
+        print(f"{'='*80}")
+        print(f"EVAL-ONLY STAGE: {stage_name}")
+        print(f"  Nodes: {num_nodes_list}")
+        print(f"  Target samples: {target_samples}")
+        print(f"{'='*80}")
+        
+        stage_datapoints = []
+        attempts = 0
+        max_attempts = target_samples * 10
+        
+        while len(stage_datapoints) < target_samples and attempts < max_attempts:
+            attempts += 1
+            
+            num_nodes = random.choice(num_nodes_list)
+            datapoint = generate_datapoint(num_nodes, stage_name)
+            
+            datapoint_hash = hashlib.md5(
+                (str(datapoint['adjacency_matrix']) + 
+                 str(datapoint['start_node']) + 
+                 str(datapoint['end_node'])).encode()
+            ).hexdigest()
+            
+            if datapoint_hash not in seen_hashes:
+                seen_hashes.add(datapoint_hash)
+                datapoint['id'] = len(all_datapoints) + len(eval_only_datapoints)
+                datapoint['stage_id'] = len(stage_datapoints)
+                stage_datapoints.append(datapoint)
+                eval_only_datapoints.append(datapoint)
+                
+                if len(stage_datapoints) % PRINT_PROGRESS_INTERVAL == 0:
+                    print(f"  Generated {len(stage_datapoints)}/{target_samples} samples...")
+        
+        print(f"  ✓ Completed eval-only stage {stage_name}: {len(stage_datapoints)} samples\n")
+    
+    # Split into train and val BY STAGE to ensure all stages are represented in val set
+    # This ensures train and val are completely separate (no overlap) AND val has all stages
+    train_datapoints = []
+    val_datapoints = []
+    
+    # Group datapoints by stage (training stages only: 3 and 4)
+    stage_groups = {}
+    for dp in all_datapoints:
+        stage = dp.get('curriculum_stage', 'unknown')
+        if stage not in stage_groups:
+            stage_groups[stage] = []
+        stage_groups[stage].append(dp)
+    
+    # Split each training stage separately (only stages 3 and 4)
+    for stage_name, stage_dps in sorted(stage_groups.items()):
+        stage_split_idx = int(len(stage_dps) * TRAIN_SPLIT)
+        train_datapoints.extend(stage_dps[:stage_split_idx])
+        val_datapoints.extend(stage_dps[stage_split_idx:])
+        print(f"  {stage_name}: {len(stage_dps[:stage_split_idx])} train, {len(stage_dps[stage_split_idx:])} val")
+    
+    # Add all eval-only datapoints to validation set (none go to train)
+    # Split them 98/2 like other stages for consistency, but all go to val
+    for eval_dp in eval_only_datapoints:
+        stage = eval_dp.get('curriculum_stage', 'unknown')
+        if stage not in stage_groups:
+            stage_groups[stage] = []
+        stage_groups[stage].append(eval_dp)
+    
+    # Add eval-only stages to val (all go to val, none to train)
+    for stage_name in ["stage3_medium", "stage4_hard"]:
+        if stage_name in stage_groups:
+            stage_dps = stage_groups[stage_name]
+            # All eval-only stages go to val
+            val_datapoints.extend(stage_dps)
+            print(f"  {stage_name} (eval-only): 0 train, {len(stage_dps)} val")
+    
+    print(f"\n  Total: {len(train_datapoints)} train, {len(val_datapoints)} val datapoints")
+    
+    # Verify training datapoints are only size 3 or 4
+    for dp in train_datapoints:
+        assert dp['num_nodes'] in [3, 4], f"Expected training graphs to be size 3 or 4, but found size {dp['num_nodes']}"
+    
+    # Note: Validation datapoints will include sizes 3, 4, 5, 6 for comprehensive evaluation
+    
+    # Group into batches of 2 (1 example + 1 query) per stage
     def create_batches(datapoints: List[dict]) -> List[dict]:
         batches = []
         for i in range(0, len(datapoints), GRAPHS_PER_BATCH):
@@ -345,7 +439,7 @@ def generate_curriculum_fewshot_dataset():
     
     print(f"\n{'='*80}")
     print("IMPORTANT: Training data is in CURRICULUM ORDER!")
-    print("Easy examples (3 nodes) come first, harder examples (7 nodes) come later.")
+    print("Easy examples (3 nodes) come first, harder examples (6 nodes) come later.")
     print("Do NOT shuffle the training data!")
     print(f"{'='*80}\n")
     

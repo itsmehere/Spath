@@ -80,14 +80,14 @@ def run(args):
 
     alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
-    ### Instruction:
-    {}
+### Instruction:
+{}
 
-    ### Input:
-    {}
+### Input:
+{}
 
-    ### Response:
-    {}"""
+### Response:
+{}"""
 
     EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
 
@@ -159,9 +159,11 @@ def run(args):
         dataset_num_proc = 2,
         packing = False,
         # Evaluation settings
-        eval_strategy = args.eval_strategy if eval_dataset else "no",
-        eval_steps = args.eval_steps if eval_dataset and args.eval_strategy == "steps" else None,
-        per_device_eval_batch_size = args.per_device_eval_batch_size if eval_dataset else None,
+        # Disable standard Trainer evaluation - we use custom callback for evaluation
+        # This avoids processing the entire eval dataset (4320 samples) unnecessarily
+        eval_strategy = "no",  # Disable Trainer's standard eval, use custom callback instead
+        eval_steps = None,
+        per_device_eval_batch_size = None,
         # Checkpoint saving settings
         save_strategy = args.save_strategy,
         save_steps = args.save_steps if args.save_strategy == "steps" else None,
@@ -179,6 +181,8 @@ def run(args):
                 self.tokenizer = tokenizer
                 self.train_dataset = train_dataset
                 self.eval_dataset = eval_dataset
+                self.logged_steps = set()  # Track which steps we've already logged to avoid duplicates
+                self.trainer = None  # Will be set in on_train_begin
                 
                 # Check if dataset has curriculum_stage field
                 has_curriculum = False
@@ -188,16 +192,14 @@ def run(args):
                         has_curriculum = True
                 
                 if has_curriculum:
-                    # Sample from each curriculum stage (25 per stage for both train and eval)
+                    # Don't sample from train dataset - only eval dataset
                     print("\n📊 Sampling completions for curriculum stages:")
-                    print("   Training set:")
-                    self.train_samples = self._sample_from_curriculum_stages(train_dataset, samples_per_stage=25)
+                    self.train_samples = []  # No train dataset sampling
                     if eval_dataset and len(eval_dataset) > 0:
                         print("   Validation set:")
-                        # Store only first 25 eval indices for evaluation
-                        eval_limit = min(25, len(eval_dataset))
-                        self.eval_all_indices = list(range(eval_limit))
-                        print(f"   Will log {len(self.eval_all_indices)} eval completions during evaluation (limited to 25)")
+                        # Sample 50 per stage from eval dataset
+                        self.eval_all_indices = self._sample_from_curriculum_stages(eval_dataset, samples_per_stage=50)
+                        print(f"   Will log {len(self.eval_all_indices)} eval completions during evaluation (50 per stage)")
                         # No separate preview samples needed
                         self.eval_samples = []
                     else:
@@ -217,8 +219,14 @@ def run(args):
                     else:
                         self.eval_all_indices = []
             
-            def _sample_from_curriculum_stages(self, dataset, samples_per_stage=2):
-                """Sample examples from each curriculum stage"""
+            def _sample_from_curriculum_stages(self, dataset, total_samples=25, samples_per_stage=None):
+                """Sample examples from each curriculum stage.
+                
+                Args:
+                    dataset: The dataset to sample from
+                    total_samples: Total number of samples to return (distributed across stages)
+                    samples_per_stage: If provided, samples this many per stage (ignores total_samples)
+                """
                 if len(dataset) == 0:
                     return []
                 
@@ -232,16 +240,37 @@ def run(args):
                             stage_indices[stage] = []
                         stage_indices[stage].append(idx)
                 
-                # Sample from each stage
+                # If samples_per_stage is provided, use old behavior
+                if samples_per_stage is not None:
+                    samples = []
+                    for stage, indices in sorted(stage_indices.items()):
+                        if len(indices) >= samples_per_stage:
+                            sampled = random.sample(indices, samples_per_stage)
+                            samples.extend(sampled)
+                            print(f"   {stage}: sampled {samples_per_stage} indices ({len(indices)} total)")
+                        elif len(indices) > 0:
+                            samples.extend(indices)
+                            print(f"   {stage}: only {len(indices)} samples available, sampled all")
+                    return samples
+                
+                # Otherwise, distribute total_samples across stages evenly
+                num_stages = len(stage_indices)
+                if num_stages == 0:
+                    return []
+                
+                samples_per_stage_rounded = max(1, total_samples // num_stages)
+                remainder = total_samples % num_stages
+                
                 samples = []
-                for stage, indices in sorted(stage_indices.items()):
-                    if len(indices) >= samples_per_stage:
-                        sampled = random.sample(indices, samples_per_stage)
+                for i, (stage, indices) in enumerate(sorted(stage_indices.items())):
+                    # Distribute remainder across first few stages
+                    num_to_sample = samples_per_stage_rounded + (1 if i < remainder else 0)
+                    num_to_sample = min(num_to_sample, len(indices))
+                    
+                    if num_to_sample > 0:
+                        sampled = random.sample(indices, num_to_sample)
                         samples.extend(sampled)
-                        print(f"   {stage}: sampled {samples_per_stage} indices {sampled} ({len(indices)} total)")
-                    elif len(indices) > 0:
-                        samples.extend(indices)
-                        print(f"   {stage}: only {len(indices)} samples available, sampled all")
+                        print(f"   {stage}: sampled {num_to_sample} indices ({len(indices)} total)")
                 
                 return samples
             
@@ -330,7 +359,8 @@ def run(args):
                         outputs = self.model.generate(
                             **inputs,
                             max_new_tokens=256,  # Reduced from 2048 - much faster, sufficient for path + reasoning
-                            do_sample=False,  # Greedy decoding - much faster than sampling
+                            do_sample=True,  # Sampling with temperature for more diverse outputs
+                            temperature=0.7,  # Moderate temperature for balanced randomness
                             pad_token_id=pad_token_id,
                             eos_token_id=eos_token_id,
                         )
@@ -376,14 +406,24 @@ def run(args):
                     all_texts.append(text)
                     all_samples.append((idx, sample))
                 
-                # Generate predictions in batch (much faster!)
-                print(f"   Generating {len(all_texts)} predictions in batch...")
-                prediction_texts = self._generate_prediction_batch(all_texts)
+                # Generate predictions in smaller batches to avoid OOM
+                # Process in chunks of 10 to stay within memory bounds
+                eval_batch_size = 10
+                print(f"   Generating {len(all_texts)} predictions in batches of {eval_batch_size}...")
+                prediction_texts = []
+                for i in range(0, len(all_texts), eval_batch_size):
+                    batch_texts = all_texts[i:i+eval_batch_size]
+                    batch_predictions = self._generate_prediction_batch(batch_texts)
+                    prediction_texts.extend(batch_predictions)
+                    print(f"      Completed {min(i+eval_batch_size, len(all_texts))}/{len(all_texts)} predictions...")
                 
                 # Process results
                 table_data = []
                 correct_count = 0
                 total_count = len(sample_indices)
+                
+                # Track accuracy per stage
+                stage_stats = {}  # {stage_name: {"correct": count, "total": count}}
                 
                 for (idx, sample), prediction_text in zip(all_samples, prediction_texts):
                     text = sample.get("text", "")
@@ -407,7 +447,15 @@ def run(args):
                     stage = None
                     if isinstance(sample, dict) and "curriculum_stage" in sample:
                         stage = sample["curriculum_stage"]
-                    stage_name = f"Stage {stage}" if stage else "Unknown"
+                    # Use the raw stage name (e.g., "stage1_baby") for consistency
+                    stage_name = stage if stage else "unknown"
+                    
+                    # Track per-stage statistics
+                    if stage_name not in stage_stats:
+                        stage_stats[stage_name] = {"correct": 0, "total": 0}
+                    stage_stats[stage_name]["total"] += 1
+                    if is_correct:
+                        stage_stats[stage_name]["correct"] += 1
                     
                     table_data.append({
                         "stage": stage_name,
@@ -420,8 +468,29 @@ def run(args):
                         "correct": is_correct,
                     })
                 
-                # Calculate accuracy
+                # Calculate overall accuracy
                 accuracy = (correct_count / total_count * 100) if total_count > 0 else 0.0
+                
+                # Calculate accuracy per stage
+                stage_accuracies = {}
+                
+                # Build metrics dictionary - start with overall accuracy
+                wandb_log_dict = {
+                    f"accuracy/{table_name}": accuracy,
+                    f"accuracy/{table_name}_count": f"{correct_count}/{total_count}",
+                }
+                
+                # Add per-stage accuracy metrics
+                for stage_name, stats in sorted(stage_stats.items()):
+                    stage_correct = stats["correct"]
+                    stage_total = stats["total"]
+                    stage_accuracy = (stage_correct / stage_total * 100) if stage_total > 0 else 0.0
+                    stage_accuracies[stage_name] = stage_accuracy
+                    # Log per-stage accuracy to wandb - use sanitized stage name
+                    # Stage names are already in format like "stage1_baby", just ensure lowercase
+                    sanitized_stage = stage_name.lower().replace(' ', '_')
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}"] = stage_accuracy
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}_count"] = f"{stage_correct}/{stage_total}"
                 
                 # Create wandb table with accuracy information
                 table = wandb.Table(
@@ -432,73 +501,129 @@ def run(args):
                         for row in table_data
                     ]
                 )
+                # Make table name unique per step to avoid overwriting
+                # Tables in Wandb overwrite if same name is used, so include step number
+                log_step = int(step) if step is not None else 0
+                table_key = f"completions/{table_name}_step_{log_step}"
+                wandb_log_dict[table_key] = table
                 
-                # Log table and accuracy to wandb
-                wandb.log({
-                    f"completions/{table_name}": table,
-                    f"accuracy/{table_name}": accuracy,
-                    f"accuracy/{table_name}_count": f"{correct_count}/{total_count}",
-                }, step=step)
+                # Also keep the main table name for latest view (will overwrite, but that's okay for "latest")
+                wandb_log_dict[f"completions/{table_name}"] = table
+                
+                # Log metrics using trainer.log() for proper step tracking (like PPO example)
+                # This ensures metrics are properly tracked in Trainer's log_history
+                metrics_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('accuracy/')}
+                
+                # Log tables separately via wandb.log (trainer.log doesn't handle tables well)
+                tables_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('completions/')}
+                
+                print(f"   📊 Logging to wandb at step {log_step}")
+                print(f"   📊 Metrics being logged: {list(metrics_only.keys())}")
+                print(f"   📊 Metrics values: {[(k, v) for k, v in metrics_only.items()]}")
+                print(f"   📊 Tables being logged: {list(tables_only.keys())}")
+                print(f"   📊 Trainer available: {self.trainer is not None}")
+                
+                # Log metrics - let Wandb handle step tracking automatically
+                # Don't specify step or commit - Wandb will use current step and handle commits
+                import wandb
+                
+                if metrics_only:
+                    print(f"   📊 Logging {len(metrics_only)} metrics to wandb...")
+                    wandb.log(metrics_only)
+                    print(f"   ✅ Metrics logged successfully")
+                
+                # For tables, let Wandb handle step tracking automatically
+                if tables_only:
+                    print(f"   📊 Logging {len(tables_only)} tables to wandb...")
+                    wandb.log(tables_only)
+                    print(f"   ✅ Tables logged successfully")
                 
                 # Print accuracy to console
-                print(f"\n📊 {table_name.upper()} Accuracy: {correct_count}/{total_count} = {accuracy:.2f}%")
+                print(f"\n📊 {table_name.upper()} Overall Accuracy: {correct_count}/{total_count} = {accuracy:.2f}%")
+                print(f"\n📊 {table_name.upper()} Accuracy by Stage:")
+                for stage_name in sorted(stage_accuracies.keys()):
+                    stats = stage_stats[stage_name]
+                    stage_acc = stage_accuracies[stage_name]
+                    print(f"   {stage_name}: {stats['correct']}/{stats['total']} = {stage_acc:.2f}%")
             
             def on_train_begin(self, args, state, control, **kwargs):
-                """Log initial completions at training start"""
-                # Log initial predictions at step 0
-                if self.train_samples:
-                    self._log_completions_table(
-                        self.train_dataset, 
-                        self.train_samples, 
-                        "train", 
-                        0
-                    )
-                
-                # Log eval completions at step 0 (use eval_all_indices if available, otherwise eval_samples)
-                if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
-                    self._log_completions_table(
-                        self.eval_dataset, 
-                        self.eval_all_indices, 
-                        "val", 
-                        0
-                    )
-                elif self.eval_samples and self.eval_dataset:
-                    self._log_completions_table(
-                        self.eval_dataset, 
-                        self.eval_samples, 
-                        "val", 
-                        0
-                    )
+                """Store trainer reference at training start"""
+                # Store trainer reference for logging
+                self.trainer = kwargs.get("trainer")
+                # Note: We don't log here - we'll log at step 0 in on_evaluate instead
+                # This avoids timing issues where Wandb has already moved past step 0
             
-            def on_evaluate(self, args, state, control, logs=None, **kwargs):
-                """Log completions when evaluation actually runs"""
-                # This callback is only called during actual evaluation
-                # Log train completions
-                if self.train_samples:
-                    self._log_completions_table(
-                        self.train_dataset, 
-                        self.train_samples, 
-                        "train", 
-                        state.global_step
-                    )
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                """Store trainer reference when available (not used for evaluation logging)"""
+                # Store trainer reference if available (for potential future use)
+                if self.trainer is None:
+                    self.trainer = kwargs.get("trainer")
+                # Note: We don't log evaluation metrics here - only in on_evaluate
+                # This avoids timing issues where state.global_step has advanced past the eval step
+            
+            def on_step_end(self, args, state, control, **kwargs):
+                """Log ground truth accuracy metrics and completions at evaluation steps"""
+                # Store trainer reference if available
+                if self.trainer is None:
+                    self.trainer = kwargs.get("trainer")
                 
-                # Log eval completions (limited to 25 samples) - this is the main val table
+                # Check if this is an evaluation step (every eval_steps, or step 0)
+                # Use the eval_steps from training args (default 25)
+                eval_steps = 25  # Default, matches --eval_steps 25 in script
+                if hasattr(args, 'eval_steps') and args.eval_steps:
+                    eval_steps = args.eval_steps
+                
+                # Only run evaluation at step 0 and every eval_steps
+                if state.global_step % eval_steps != 0 and state.global_step != 0:
+                    return
+                
+                # This is an evaluation step
+                eval_step = state.global_step
+                
+                # Skip if we've already logged at this step (shouldn't happen, but safety check)
+                if eval_step in self.logged_steps:
+                    print(f"⏭️  Skipping duplicate log at step {eval_step} (already logged)")
+                    return
+                
+                print(f"\n🔍 Running custom evaluation at step {eval_step}")
+                print(f"   hasattr(self, 'eval_all_indices'): {hasattr(self, 'eval_all_indices')}")
+                if hasattr(self, 'eval_all_indices'):
+                    print(f"   eval_all_indices: {self.eval_all_indices[:5] if self.eval_all_indices else None}... (length: {len(self.eval_all_indices) if self.eval_all_indices else 0})")
+                print(f"   eval_dataset exists: {self.eval_dataset is not None}")
+                
+                # Log eval completions and accuracy metrics (50 per stage)
+                # This logs both the completions table AND the accuracy metrics
                 if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
-                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions to wandb (limited to 25)...")
-                    self._log_completions_table(
-                        self.eval_dataset, 
-                        self.eval_all_indices, 
-                        "val", 
-                        state.global_step
-                    )
+                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions and accuracy metrics to wandb (50 per stage)...")
+                    try:
+                        self._log_completions_table(
+                            self.eval_dataset, 
+                            self.eval_all_indices, 
+                            "val", 
+                            eval_step
+                        )
+                        self.logged_steps.add(eval_step)
+                        print(f"✅ Successfully logged completions and accuracy metrics at step {eval_step}")
+                    except Exception as e:
+                        print(f"❌ Error logging completions at step {eval_step}: {e}")
+                        import traceback
+                        traceback.print_exc()
                 elif self.eval_samples and self.eval_dataset:
                     # Fallback if eval_all_indices not available
+                    print(f"📊 Using fallback eval_samples (length: {len(self.eval_samples)})")
                     self._log_completions_table(
                         self.eval_dataset, 
                         self.eval_samples, 
                         "val", 
-                        state.global_step
+                        eval_step
                     )
+                    self.logged_steps.add(eval_step)
+                else:
+                    print(f"⚠️  No eval samples available to log! eval_all_indices={hasattr(self, 'eval_all_indices')}, eval_samples={len(self.eval_samples) if hasattr(self, 'eval_samples') else 'N/A'}")
+            
+            def on_evaluate(self, args, state, control, logs=None, **kwargs):
+                """This won't be called since eval_strategy='no', but kept for compatibility"""
+                pass
         
         completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset)
         callbacks = [completions_callback]
