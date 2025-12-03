@@ -286,24 +286,21 @@ def run(args):
                 return text
             
             def _parse_path_from_output(self, text):
-                """Parse shortest path from model output"""
-                # Try to find JSON array format [0, 1, 2]
-                match = re.search(r'\[([-\d,\s]+)\]', text)
-                if match:
+                """Parse shortest path from model output - uses LAST set of brackets found"""
+                # Find ALL matches of bracket patterns [0, 1, 2]
+                all_matches = re.findall(r'\[([-\d,\s]+)\]', text)
+                
+                if all_matches:
+                    # Use the LAST match (most likely the final answer)
+                    last_match = all_matches[-1]
                     try:
-                        numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
-                        return numbers
+                        numbers = [int(item.strip()) for item in last_match.split(",") if item.strip()]
+                        # Only return if it looks like a valid path (at least 2 nodes)
+                        if len(numbers) >= 2:
+                            return numbers
                     except ValueError:
                         pass
-                # Try to find in "Final Answer" format
-                if "Final Answer" in text or "shortest path" in text.lower():
-                    match = re.search(r'\[([-\d,\s]+)\]', text)
-                    if match:
-                        try:
-                            numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
-                            return numbers
-                        except ValueError:
-                            pass
+                
                 return None
             
             def _extract_ground_truth_path(self, output_text):
