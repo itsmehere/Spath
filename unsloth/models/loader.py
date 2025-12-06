@@ -101,6 +101,7 @@ global DISABLE_COMPILE_MODEL_NAMES
 # Must be alphabetically sorted for each entry
 DISABLE_COMPILE_MODEL_NAMES = [
     "aya_vision",
+    "gpt2",  # GPT-2 has compilation issues in Unsloth
     "modernbert",
     "granite,llava_next",  # Granite-vision 3
 ]
