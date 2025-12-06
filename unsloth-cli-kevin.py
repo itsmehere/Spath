@@ -286,15 +286,16 @@ def run(args):
         import wandb
         
         class CompletionsCallback(TrainerCallback):
-            def __init__(self, model, tokenizer, train_dataset, eval_dataset):
+            def __init__(self, model, tokenizer, train_dataset, eval_dataset, max_eval_samples=100):
                 self.model = model
                 self.tokenizer = tokenizer
                 self.train_dataset = train_dataset
                 self.eval_dataset = eval_dataset
+                self.max_eval_samples = max_eval_samples
                 # Sample 5 datapoints from train set
-                self.train_samples = random.sample(range(len(train_dataset)), min(5, len(train_dataset))) if len(train_dataset) > 0 else []
+                self.train_samples = random.sample(range(len(train_dataset)), min(20, len(train_dataset))) if len(train_dataset) > 0 else []
                 # Sample datapoints from eval set
-                self.eval_samples = list(range(min(5, len(eval_dataset)))) if eval_dataset and len(eval_dataset) > 0 else []
+                self.eval_samples = random.sample(range(len(eval_dataset)), min(20, len(eval_dataset))) if eval_dataset and len(eval_dataset) > 0 else []
                 self.should_log_completions = False  # Flag to trigger completion logging
                 self.last_logged_step = -1  # Track last step we logged to avoid duplicates
             
@@ -450,8 +451,52 @@ def run(args):
                 accuracy = correct / total if total > 0 else 0.0
                 return accuracy, correct, total
             
+            def _compute_mae(self, dataset, max_samples=None):
+                """Compute mean absolute error on dataset by comparing predictions to ground truth"""
+                if not dataset or len(dataset) == 0:
+                    return 0.0, 0
+                
+                # Limit number of samples for efficiency (evaluate on subset)
+                num_samples = min(max_samples or len(dataset), len(dataset))
+                sample_indices = list(range(num_samples))
+                
+                absolute_errors = []
+                total = 0
+                
+                for idx in sample_indices:
+                    try:
+                        sample = dataset[idx]
+                        # Decode the tokenized sample back to text
+                        text = self._decode_sample(sample)
+                        if not text:
+                            continue
+                        
+                        input_text, ground_truth = self._extract_instruction_and_output(text)
+                        
+                        # Only proceed if we have both input and ground truth
+                        if not input_text or not ground_truth:
+                            continue
+                        
+                        # Generate prediction using just the input
+                        prediction_text = self._generate_prediction(input_text)
+                        
+                        # Extract numbers from both ground truth and prediction
+                        gt_number = self._extract_number_from_text(ground_truth)
+                        pred_number = self._extract_number_from_text(prediction_text)
+                        
+                        if gt_number is not None and pred_number is not None:
+                            absolute_error = abs(gt_number - pred_number)
+                            absolute_errors.append(absolute_error)
+                            total += 1
+                    except Exception as e:
+                        # Skip samples that cause errors
+                        continue
+                
+                mae = sum(absolute_errors) / total if total > 0 else 0.0
+                return mae, total
+            
             def _log_completions_table(self, dataset, sample_indices, table_name, state=None):
-                """Log completions table to wandb"""
+                """Log completions table to wandb following best practices"""
                 if not sample_indices:
                     return
                 
@@ -495,8 +540,10 @@ def run(args):
                         for row in table_data
                     ])
                     
-                    # Don't specify step - let wandb use its internal step tracking
-                    # This avoids out-of-order warnings when step advances during table generation
+                    # Following wandb best practices: don't specify step parameter
+                    # Let wandb use its internal step tracking to avoid conflicts
+                    # Transformers' WandbCallback handles step synchronization automatically
+                    # When called from on_log, this will be batched with metrics logged by Transformers
                     wandb.log({f"completions/{table_name}": table})
             
             def on_train_begin(self, args, state, control, **kwargs):
@@ -519,33 +566,47 @@ def run(args):
                     )
             
             def on_evaluate(self, args, state, control, logs=None, **kwargs):
-                """Compute accuracy during evaluation and set flag to log completions"""
-                import wandb
-                # Compute accuracy during evaluation on the full eval dataset
+                """Compute accuracy and MAE during evaluation and set flag to log completions"""
+                # Compute accuracy and MAE during evaluation on a subset of eval dataset for speed
                 # This happens during the eval pass, so it's concurrent with eval_loss computation
                 if self.eval_dataset and len(self.eval_dataset) > 0:
-                    # Use the entire eval dataset for accuracy calculation
+                    # Use a limited number of samples for accuracy calculation to speed up evaluation
+                    # If max_eval_samples is -1, use all samples
+                    max_samples = None if self.max_eval_samples == -1 else self.max_eval_samples
                     eval_accuracy, correct, total = self._compute_accuracy(
                         self.eval_dataset, 
-                        max_samples=None  # Use all samples
+                        max_samples=max_samples
                     )
-                    # Store accuracy to add to logs
+                    # Compute mean absolute error
+                    eval_mae, mae_total = self._compute_mae(
+                        self.eval_dataset,
+                        max_samples=max_samples
+                    )
+                    
+                    # Store metrics to add to logs
                     self.eval_accuracy = eval_accuracy
                     self.eval_correct = correct
                     self.eval_total = total
+                    self.eval_mae = eval_mae
+                    self.eval_mae_total = mae_total
                     
-                    # Add accuracy to logs directly so it appears with eval_loss
+                    # Add metrics to logs directly so they appear with eval_loss
+                    # When report_to="wandb" is set, transformers automatically logs
+                    # all metrics in the logs dict to wandb with proper step tracking
+                    # Following wandb best practices: metrics added to logs dict are automatically
+                    # logged with the correct step by Transformers' WandbCallback
                     if logs is not None:
+                        # Use consistent metric naming convention (eval_ prefix for evaluation metrics)
                         logs["eval_accuracy"] = eval_accuracy
                         logs["eval_correct"] = correct
                         logs["eval_total"] = total
-                    
-                    # Explicitly log to wandb to ensure it's tracked
-                    wandb.log({
-                        "eval_accuracy": eval_accuracy,
-                        "eval_correct": correct,
-                        "eval_total": total,
-                    }, step=state.global_step)
+                        
+                        # Also log as percentage for better visualization in wandb
+                        logs["eval_accuracy_pct"] = eval_accuracy * 100.0
+                        
+                        # Log mean absolute error
+                        logs["eval_mae"] = eval_mae
+                        logs["eval_mae_total"] = mae_total
                     
                     # Print one example prompt and completion
                     try:
@@ -577,11 +638,34 @@ def run(args):
                 self.should_log_completions = True
             
             def on_log(self, args, state, control, logs=None, **kwargs):
-                """Log completions and accuracy when metrics are logged, ensuring correct step"""
+                """Log completions, accuracy, and MAE when metrics are logged, ensuring correct step"""
                 import wandb
                 
                 # Only log if flag is set and we haven't logged at this step yet
                 if self.should_log_completions and state.global_step != self.last_logged_step:
+                    # Following wandb best practices: explicitly log metrics to ensure they're recorded
+                    # Even though Transformers' WandbCallback should log metrics from logs dict,
+                    # explicitly logging ensures they're definitely captured
+                    
+                    metrics_to_log = {}
+                    
+                    # Explicitly log accuracy and MAE metrics
+                    if hasattr(self, 'eval_accuracy') and self.eval_accuracy is not None:
+                        metrics_to_log["eval_accuracy"] = self.eval_accuracy
+                        metrics_to_log["eval_accuracy_pct"] = self.eval_accuracy * 100.0
+                        metrics_to_log["eval_correct"] = self.eval_correct
+                        metrics_to_log["eval_total"] = self.eval_total
+                        print(f"Accuracy: {self.eval_accuracy:.4f} ({self.eval_correct}/{self.eval_total})")
+                    
+                    if hasattr(self, 'eval_mae') and self.eval_mae is not None:
+                        metrics_to_log["eval_mae"] = self.eval_mae
+                        metrics_to_log["eval_mae_total"] = self.eval_mae_total
+                        print(f"MAE: {self.eval_mae:.4f} (computed on {self.eval_mae_total} samples)")
+                    
+                    # Log metrics explicitly to wandb (wandb handles step tracking automatically)
+                    if metrics_to_log:
+                        wandb.log(metrics_to_log)
+                    
                     # Log train completions
                     if self.train_samples:
                         self._log_completions_table(
@@ -600,16 +684,11 @@ def run(args):
                             state
                         )
                     
-                    # Accuracy is already computed in on_evaluate and added to logs
-                    # Just log it to wandb if needed (it should already be in logs from on_evaluate)
-                    if hasattr(self, 'eval_accuracy') and self.eval_accuracy is not None:
-                        print(f"Accuracy: {self.eval_accuracy:.4f} ({self.eval_correct}/{self.eval_total})")
-                    
                     # Reset flag and track step
                     self.should_log_completions = False
                     self.last_logged_step = state.global_step
         
-        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset)
+        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset, max_eval_samples=args.max_eval_samples)
         callbacks = [completions_callback]
     else:
         callbacks = None
@@ -631,8 +710,43 @@ def run(args):
         mlm=False,  # Causal LM, not masked LM
     )
     
+    # Custom Trainer class to control data shuffling for curriculum learning
+    class CurriculumTrainer(Trainer):
+        def get_train_dataloader(self):
+            """Override to control shuffling based on args.dataloader_shuffle"""
+            if self.train_dataset is None:
+                raise ValueError("Trainer: training requires a train_dataset.")
+            
+            train_dataset = self.train_dataset
+            if hasattr(train_dataset, "__len__") and len(train_dataset) == 0:
+                raise ValueError("Trainer: train_dataset must have a length > 0.")
+            
+            # Import here to avoid circular imports
+            from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
+            
+            # Use SequentialSampler if shuffle is disabled, RandomSampler if enabled
+            if args.dataloader_shuffle:
+                train_sampler = RandomSampler(train_dataset)
+                print("🔄 Using RandomSampler - data will be shuffled each epoch")
+            else:
+                train_sampler = SequentialSampler(train_dataset)
+                print("🔄 Using SequentialSampler - data order preserved (curriculum)")
+                print("   ⚠️  IMPORTANT: Training data is in CURRICULUM ORDER!")
+                print("   ⚠️  Easy examples (smaller graphs) come first, harder examples (larger graphs) come later.")
+            
+            # CRITICAL: When using a sampler, shuffle parameter is ignored
+            # SequentialSampler = no shuffling, RandomSampler = shuffling
+            return DataLoader(
+                train_dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                sampler=train_sampler,  # This controls order - SequentialSampler preserves order
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+    
     # Initialize trainer
-    trainer = Trainer(
+    trainer = CurriculumTrainer(
         model = model,
         processing_class = tokenizer,  # Use processing_class instead of tokenizer (new API)
         train_dataset = dataset,
@@ -810,6 +924,18 @@ if __name__ == "__main__":
         type = int,
         default = 2,
         help = "Batch size per device for evaluation. Default is 2.",
+    )
+    training_group.add_argument(
+        "--max_eval_samples",
+        type = int,
+        default = 100,
+        help = "Maximum number of samples to use for accuracy/MAE computation during evaluation. Default is 100. Set to -1 to use all samples (slower).",
+    )
+    training_group.add_argument(
+        "--dataloader_shuffle",
+        action = "store_true",
+        default = False,
+        help = "Shuffle training data each epoch. Default is False to preserve curriculum order. Set this flag to enable shuffling.",
     )
     training_group.add_argument(
         "--save_strategy",

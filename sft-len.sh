@@ -39,7 +39,7 @@ python unsloth-cli-kevin.py \
     --dataset "spath_data_gen/data/train_len.json" \
     --eval_dataset "spath_data_gen/data/val_len.json" \
     --eval_strategy "steps" \
-    --eval_steps 20 \
+    --eval_steps 50 \
     --r 128 \
     --lora_alpha 128 \
     --lora_dropout 0.0 \
@@ -49,7 +49,7 @@ python unsloth-cli-kevin.py \
     --per_device_eval_batch_size 2 \
     --warmup_steps 5 \
     --max_steps 100000 \
-    --learning_rate 2e-4 \
+    --learning_rate 3e-4 \
     --optim "adamw_8bit" \
     --output_dir "Models" \
     --save_strategy "steps" \
@@ -62,5 +62,6 @@ python unsloth-cli-kevin.py \
     --save_model \
     --save_path "gpt2-medium-Spath" \
     --save_method "merged_16bit" \
-    --logging_steps 1
+    --logging_steps 1 \
+    --max_eval_samples -1 \
 
