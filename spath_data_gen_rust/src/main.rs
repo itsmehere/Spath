@@ -368,18 +368,37 @@ struct Args {
     /// Enable curriculum learning with progressive difficulty based on graph vertex count
     #[arg(long, default_value_t = true)]
     use_curriculum: bool,
+
+    /// Number of samples per curriculum stage
+    #[arg(long, default_value_t = 3000)]
+    samples_per_stage: usize,
+
+    /// Ratio of rehearsal samples from previous stages (0.1 = 10%)
+    #[arg(long, default_value_t = 0.1)]
+    rehearsal_ratio: f64,
+
+    /// Maximum edge weight cap for scaling (used in get_scaled_max_weight)
+    #[arg(long, default_value_t = 50)]
+    max_weight_cap: i32,
 }
 
-fn get_scaled_max_weight(n: usize) -> i32 {
-    // Linear scaling: start at 10 for n=5, increase by 2 per node, cap at 50
-    // Formula: max_weight = min(50, 10 + (n - 5) * 2)
+fn get_scaled_max_weight(n: usize, max_weight_cap: i32) -> i32 {
+    // Linear scaling: start at 10 for n=5, increase by 2 per node, cap at max_weight_cap
+    // Formula: max_weight = min(max_weight_cap, 10 + (n - 5) * 2)
     let calculated = 10 + (n as i32 - 5) * 2;
-    calculated.min(50)
+    calculated.min(max_weight_cap)
 }
 
-fn get_default_curriculum_stages(min_nodes: usize, max_nodes: usize, num_examples: usize) -> Vec<CurriculumStage> {
+fn get_default_curriculum_stages(
+    min_nodes: usize,
+    max_nodes: usize,
+    num_examples: usize,
+    samples_per_stage: usize,
+    min_weight: i32,
+    max_weight_cap: i32,
+) -> Vec<CurriculumStage> {
     // Create curriculum stages: start with n = k (num_examples) and gradually increase by 1
-    // Edge weights also scale with n: max_weight = 10 + (n - 5) * 2 (from 10 at n=5 to 50 at n=30)
+    // Edge weights also scale with n: max_weight = 10 + (n - 5) * 2 (from 10 at n=5 to max_weight_cap)
     // Each stage uses a single node count
     let mut stages = Vec::new();
     
@@ -389,12 +408,12 @@ fn get_default_curriculum_stages(min_nodes: usize, max_nodes: usize, num_example
     // Generate stages from start_node to max_nodes, incrementing by 1
     let mut stage_num = 1;
     for n in start_node..=max_nodes {
-        let max_weight = get_scaled_max_weight(n);
+        let max_weight = get_scaled_max_weight(n, max_weight_cap);
         stages.push(CurriculumStage {
             num_nodes: vec![n],
-            samples: 3000, // 3K samples per stage
+            samples: samples_per_stage,
             name: format!("stage{}_n{}", stage_num, n),
-            min_weight: 1,
+            min_weight,
             max_weight,
         });
         stage_num += 1;
@@ -404,9 +423,16 @@ fn get_default_curriculum_stages(min_nodes: usize, max_nodes: usize, num_example
 }
 
 fn generate_curriculum_dataset(args: &Args, rng: &mut StdRng) {
-    let curriculum_stages = get_default_curriculum_stages(args.min_nodes, args.max_nodes, args.num_examples);
+    let curriculum_stages = get_default_curriculum_stages(
+        args.min_nodes,
+        args.max_nodes,
+        args.num_examples,
+        args.samples_per_stage,
+        args.min_weight,
+        args.max_weight_cap,
+    );
     let total_samples: usize = curriculum_stages.iter().map(|s| s.samples).sum();
-    let rehearsal_ratio = 0.1; // 10% rehearsal samples from previous stages
+    let rehearsal_ratio = args.rehearsal_ratio;
     
     println!("Generating curriculum learning dataset with {} stages...", curriculum_stages.len());
     println!("Graph parameters: Erdős–Rényi G(n, p) with n in [{}, {}], p = {}", 
