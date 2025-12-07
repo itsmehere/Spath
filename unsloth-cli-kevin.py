@@ -521,13 +521,15 @@ def run(args):
                         prediction = self._generate_prediction(input_text)
                         
                         table_data.append({
-                            "input": input_text[:500] if input_text else "",  # Truncate for display
-                            "ground_truth": ground_truth[:500] if ground_truth else "",
-                            "prediction": prediction[:500] if prediction else "",
+                            "sample_idx": idx,
+                            "input": input_text if input_text else "",  # Truncate for display
+                            "ground_truth": ground_truth if ground_truth else "",
+                            "prediction": prediction if prediction else "",
                         })
                     except Exception as e:
                         # Skip samples that cause errors, but log a row with error info
                         table_data.append({
+                            "sample_idx": idx,
                             "input": f"Error decoding sample {idx}",
                             "ground_truth": "",
                             "prediction": str(e)[:200],
