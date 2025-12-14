@@ -30,14 +30,14 @@ else
     echo "Python path: $(which python)"
 fi
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=7
 
 python unsloth-cli-kevin.py \
     --model_name "gpt2-medium" \
     --max_seq_length 2048 \
     --load_in_4bit \
-    --dataset "spath_data_gen/data/train_len.json" \
-    --eval_dataset "spath_data_gen/data/val_len.json" \
+    --dataset "spath_data_gen/data/train_len_baseline.json" \
+    --eval_dataset "spath_data_gen/data/val_len_baseline.json" \
     --eval_strategy "steps" \
     --eval_steps 50 \
     --r 128 \
@@ -58,7 +58,7 @@ python unsloth-cli-kevin.py \
     --report_to "wandb" \
     --wandb_entity "spath" \
     --wandb_project "Spath" \
-    --wandb_run_name "Spath_len" \
+    --wandb_run_name "Spath_len_fast_zero_shot" \
     --save_model \
     --save_path "gpt2-medium-Spath" \
     --save_method "merged_16bit" \
