@@ -36,8 +36,8 @@ python unsloth-cli-kevin.py \
     --model_name "gpt2-medium" \
     --max_seq_length 2048 \
     --load_in_4bit \
-    --dataset "spath_data_gen/data/train_len_baseline.json" \
-    --eval_dataset "spath_data_gen/data/val_len_baseline.json" \
+    --dataset "spath_data_gen/data/train_len_3shot.json" \
+    --eval_dataset "spath_data_gen/data/val_len_3shot.json" \
     --eval_strategy "steps" \
     --eval_steps 50 \
     --r 128 \
@@ -58,7 +58,7 @@ python unsloth-cli-kevin.py \
     --report_to "wandb" \
     --wandb_entity "spath" \
     --wandb_project "Spath" \
-    --wandb_run_name "Spath_len_fast_zero_shot" \
+    --wandb_run_name "Spath_len_fast_3shot" \
     --save_model \
     --save_path "gpt2-medium-Spath" \
     --save_method "merged_16bit" \

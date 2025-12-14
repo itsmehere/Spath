@@ -38,7 +38,7 @@ def run(args):
     import torch
     import os
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig
-    from trl import DataCollatorForCompletionOnlyLM
+    from transformers import DataCollatorForLanguageModeling
     from datasets import load_dataset
     from transformers.utils import strtobool
     from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
@@ -709,12 +709,13 @@ def run(args):
     # Custom collator that finds the LAST occurrence of "Output: " since there may be multiple
     response_template_ids = tokenizer.encode(RESPONSE_TEMPLATE, add_special_tokens=False)
     
-    class DataCollatorForCompletionOnlyLMLastOccurrence(DataCollatorForCompletionOnlyLM):
-        """Custom data collator that finds the LAST occurrence of the response template."""
+    class DataCollatorForCompletionOnlyLMLastOccurrence(DataCollatorForLanguageModeling):
+        """Custom data collator that finds the LAST occurrence of the response template and masks everything before it."""
         
         def __init__(self, response_template, tokenizer, **kwargs):
-            super().__init__(response_template, tokenizer=tokenizer, **kwargs)
-            # Store the response template token IDs ourselves for reliability
+            # Initialize base class with mlm=False for causal LM
+            super().__init__(tokenizer=tokenizer, mlm=False, **kwargs)
+            # Store the response template token IDs
             if isinstance(response_template, list):
                 self._response_template_ids = response_template
             else:
@@ -722,20 +723,20 @@ def run(args):
         
         def torch_call(self, examples):
             import torch
+            # First, get the batch from the parent class (handles padding, etc.)
             batch = super().torch_call(examples)
             
-            # The parent class masks based on FIRST occurrence, we need LAST occurrence
-            # Re-process labels to find the last "Output: " and mask everything before it
+            # Now mask everything before (and including) the LAST occurrence of the response template
             for i, input_ids in enumerate(batch["input_ids"]):
                 labels = batch["labels"][i].clone()
                 input_ids_list = input_ids.tolist()
                 
                 # Find ALL occurrences of response_template_ids in input_ids
                 response_token_ids = self._response_template_ids
-                
-                # Find indices where response template starts
                 template_len = len(response_token_ids)
                 occurrences = []
+                
+                # Find all occurrences of the template
                 for j in range(len(input_ids_list) - template_len + 1):
                     if input_ids_list[j:j + template_len] == response_token_ids:
                         occurrences.append(j)
@@ -747,6 +748,10 @@ def run(args):
                     # Response starts AFTER the template
                     response_start = last_idx + template_len
                     labels[:response_start] = -100
+                    batch["labels"][i] = labels
+                else:
+                    # If no template found, mask everything (shouldn't happen in normal training)
+                    labels[:] = -100
                     batch["labels"][i] = labels
             
             return batch
