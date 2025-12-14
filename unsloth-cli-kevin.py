@@ -37,7 +37,8 @@ import random
 def run(args):
     import torch
     import os
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, BitsAndBytesConfig
+    from trl import DataCollatorForCompletionOnlyLM
     from datasets import load_dataset
     from transformers.utils import strtobool
     from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
@@ -187,6 +188,7 @@ def run(args):
     # {}"""
 
     modified_prompt = "{input} {output}"
+    RESPONSE_TEMPLATE = "Output: "
 
     EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
 
@@ -331,18 +333,17 @@ def run(args):
             
             def _extract_instruction_and_output(self, text):
                 """Extract input and output from formatted text"""
-                # The text is formatted as: "{input} {output}<eos>"
-                # Extract input and output from the modified format: "{input} {output}"
+                # The text is formatted as: "{input (ends with 'Output: ')} {output}<eos>"
                 eos_token = self.tokenizer.eos_token
                 # Remove EOS token if present
                 text_without_eos = text.rstrip(eos_token) if eos_token else text
-                # Split on the last space (output has no spaces, so everything after last space is output)
-                if " " in text_without_eos:
-                    parts = text_without_eos.rsplit(" ", 1)
-                    input_text = parts[0]
+                # Split on "Output: " marker (the input ends with this)
+                if "Output: " in text_without_eos:
+                    parts = text_without_eos.rsplit("Output: ", 1)
+                    input_text = parts[0] + "Output: "  # Keep "Output: " as part of the prompt
                     output = parts[1] if len(parts) > 1 else ""
                 else:
-                    # No space found, treat entire text as input
+                    # No marker found, treat entire text as input
                     input_text = text_without_eos
                     output = ""
                 return input_text, output
@@ -360,6 +361,7 @@ def run(args):
             def _generate_prediction(self, input_text):
                 """Generate prediction from model given input text"""
                 try:
+                    # input_text already ends with "Output: " so use it directly
                     # Tokenize the input
                     inputs = self.tokenizer(input_text, return_tensors="pt", truncation=True, max_length=args.max_seq_length - 50).to(self.model.device)
                     
@@ -703,14 +705,58 @@ def run(args):
         # in the callback instead. This function is here for compatibility.
         return {}
     
-    # Data collator - handles padding dynamically
-    # For GPT-2, we need to ensure padding is done correctly
-    # Important: We set mlm=False for causal LM, and the collator will shift labels
-    # so the model learns to predict the next token including EOS tokens
-    data_collator = DataCollatorForLanguageModeling(
+    # Data collator - masks prompt tokens so loss is only computed on the response
+    # Custom collator that finds the LAST occurrence of "Output: " since there may be multiple
+    response_template_ids = tokenizer.encode(RESPONSE_TEMPLATE, add_special_tokens=False)
+    
+    class DataCollatorForCompletionOnlyLMLastOccurrence(DataCollatorForCompletionOnlyLM):
+        """Custom data collator that finds the LAST occurrence of the response template."""
+        
+        def __init__(self, response_template, tokenizer, **kwargs):
+            super().__init__(response_template, tokenizer=tokenizer, **kwargs)
+            # Store the response template token IDs ourselves for reliability
+            if isinstance(response_template, list):
+                self._response_template_ids = response_template
+            else:
+                self._response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+        
+        def torch_call(self, examples):
+            import torch
+            batch = super().torch_call(examples)
+            
+            # The parent class masks based on FIRST occurrence, we need LAST occurrence
+            # Re-process labels to find the last "Output: " and mask everything before it
+            for i, input_ids in enumerate(batch["input_ids"]):
+                labels = batch["labels"][i].clone()
+                input_ids_list = input_ids.tolist()
+                
+                # Find ALL occurrences of response_template_ids in input_ids
+                response_token_ids = self._response_template_ids
+                
+                # Find indices where response template starts
+                template_len = len(response_token_ids)
+                occurrences = []
+                for j in range(len(input_ids_list) - template_len + 1):
+                    if input_ids_list[j:j + template_len] == response_token_ids:
+                        occurrences.append(j)
+                
+                if occurrences:
+                    # Use the LAST occurrence
+                    last_idx = occurrences[-1]
+                    # Mask everything before (and including) the response template
+                    # Response starts AFTER the template
+                    response_start = last_idx + template_len
+                    labels[:response_start] = -100
+                    batch["labels"][i] = labels
+            
+            return batch
+    
+    data_collator = DataCollatorForCompletionOnlyLMLastOccurrence(
+        response_template=response_template_ids,
         tokenizer=tokenizer,
-        mlm=False,  # Causal LM, not masked LM
     )
+    print(f"✅ Using DataCollatorForCompletionOnlyLM (LAST occurrence) - prompt tokens are MASKED from loss")
+    print(f"   Response template: '{RESPONSE_TEMPLATE}' -> token ids: {response_template_ids}")
     
     # Custom Trainer class to control data shuffling for curriculum learning
     class CurriculumTrainer(Trainer):
