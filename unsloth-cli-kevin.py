@@ -454,9 +454,10 @@ def run(args):
                 return accuracy, correct, total
             
             def _compute_mae(self, dataset, max_samples=None):
-                """Compute mean absolute error on dataset by comparing predictions to ground truth"""
+                """Compute mean absolute error and standard deviation on dataset by comparing predictions to ground truth"""
+                import math
                 if not dataset or len(dataset) == 0:
-                    return 0.0, 0
+                    return 0.0, 0.0, 0
                 
                 # Limit number of samples for efficiency (evaluate on subset)
                 num_samples = min(max_samples or len(dataset), len(dataset))
@@ -495,7 +496,13 @@ def run(args):
                         continue
                 
                 mae = sum(absolute_errors) / total if total > 0 else 0.0
-                return mae, total
+                # Compute standard deviation of the error
+                if total > 1:
+                    variance = sum((e - mae) ** 2 for e in absolute_errors) / (total - 1)
+                    error_std = math.sqrt(variance)
+                else:
+                    error_std = 0.0
+                return mae, error_std, total
             
             def _log_completions_table(self, dataset, sample_indices, table_name, state=None):
                 """Log completions table to wandb following best practices"""
@@ -581,8 +588,8 @@ def run(args):
                         self.eval_dataset, 
                         max_samples=max_samples
                     )
-                    # Compute mean absolute error
-                    eval_mae, mae_total = self._compute_mae(
+                    # Compute mean absolute error and standard deviation
+                    eval_mae, eval_error_std, mae_total = self._compute_mae(
                         self.eval_dataset,
                         max_samples=max_samples
                     )
@@ -592,6 +599,7 @@ def run(args):
                     self.eval_correct = correct
                     self.eval_total = total
                     self.eval_mae = eval_mae
+                    self.eval_error_std = eval_error_std
                     self.eval_mae_total = mae_total
                     
                     # Add metrics to logs directly so they appear with eval_loss
@@ -608,8 +616,9 @@ def run(args):
                         # Also log as percentage for better visualization in wandb
                         logs["eval_accuracy_pct"] = eval_accuracy * 100.0
                         
-                        # Log mean absolute error
+                        # Log mean absolute error and standard deviation
                         logs["eval_mae"] = eval_mae
+                        logs["eval_error_std"] = eval_error_std
                         logs["eval_mae_total"] = mae_total
                     
                     # Print one example prompt and completion
@@ -663,8 +672,9 @@ def run(args):
                     
                     if hasattr(self, 'eval_mae') and self.eval_mae is not None:
                         metrics_to_log["eval_mae"] = self.eval_mae
+                        metrics_to_log["eval_error_std"] = self.eval_error_std
                         metrics_to_log["eval_mae_total"] = self.eval_mae_total
-                        print(f"MAE: {self.eval_mae:.4f} (computed on {self.eval_mae_total} samples)")
+                        print(f"MAE: {self.eval_mae:.4f} ± {self.eval_error_std:.4f} (computed on {self.eval_mae_total} samples)")
                     
                     # Log metrics explicitly to wandb (wandb handles step tracking automatically)
                     if metrics_to_log:
