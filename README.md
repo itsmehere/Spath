@@ -28,7 +28,7 @@
    bash sft-len.sh
    ```
 
-Training logs to wandb and saves checkpoints to `Models/`.
+Training logs to wandb and saves checkpoints to `Models/`. Our model checkpoints are located here: https://huggingface.co/mihirgrao
 
 ## Data Generation Usage
 
