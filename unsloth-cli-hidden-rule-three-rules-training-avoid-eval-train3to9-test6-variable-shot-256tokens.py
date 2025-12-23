@@ -1,0 +1,1556 @@
+#!/usr/bin/env python3
+
+"""
+🦥 Hidden Rule Learning Training Script
+
+This script trains models to infer hidden rules from examples.
+
+TRAINING:
+- Variable-shot prompts (0, 2, 4, or 6 examples)
+- Hidden rules: 33.33% "maximum edge weight", 33.33% "no adjacent index edges", 33.33% "monotonic path" (indices only increase or only decrease)
+- All examples in a prompt share the same hidden rule
+- Model must infer rule from examples (or zero-shot)
+- true path != constrained path
+- Sizes 3-9 graphs (randomly selected per prompt)
+- Format: Uses inference format (not alpaca)
+
+EVALUATION:
+- Hidden rule: "avoid some node" (random node, not stated)
+- 0-shot, 4-shot, or 6-shot at runtime
+- Same queries for 0-shot, 4-shot, and 6-shot
+- true path != constrained path
+- Size 6 graphs only
+- Format matches training format
+
+Usage:
+    python unsloth-cli-hidden-rule-three-rules-training-avoid-eval-train3to9-test6-variable-shot-256tokens.py --model_name "unsloth/Qwen3-4B" \
+    --dataset "spath_data_gen/data/train_hidden_rule_three_rules_variable_shot_train3to9_test6_256tokens.json" \
+    --eval_dataset "spath_data_gen/data/val_hidden_rule_avoid_0shot_4shot_6shot_test6_256tokens.json" \
+    --eval_steps 200 --max_steps 1000
+
+NOTE: This version uses max_new_tokens=256.
+NOTE: Training on sizes 3-9 with variable-shot (0/2/4/6 examples), testing on size 6 only with 0/4/6-shot.
+
+To see a full list of configurable options, use:
+    python unsloth-cli-hidden-rule-three-rules-training-avoid-eval-train3to9-test6-variable-shot-256tokens.py --help
+"""
+
+import argparse
+import os
+import random
+import json
+import re
+import hashlib
+
+
+def run(args):
+    import torch
+    from unsloth import FastLanguageModel
+    from datasets import load_dataset
+    from transformers.utils import strtobool
+    from trl import SFTTrainer, SFTConfig
+    from transformers import TrainingArguments
+    from unsloth import is_bfloat16_supported
+    import logging
+
+    logging.getLogger("hf-to-gguf").setLevel(logging.WARNING)
+
+    # Load model and tokenizer
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = args.model_name,
+        max_seq_length = args.max_seq_length,
+        dtype = args.dtype,
+        load_in_4bit = args.load_in_4bit,
+    )
+
+    # Configure PEFT model
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = args.r,
+        target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_alpha = args.lora_alpha,
+        lora_dropout = args.lora_dropout,
+        bias = args.bias,
+        use_gradient_checkpointing = args.use_gradient_checkpointing,
+        random_state = args.random_state,
+        use_rslora = args.use_rslora,
+        loftq_config = args.loftq_config,
+    )
+
+    EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+
+    use_modelscope = strtobool(os.environ.get("UNSLOTH_USE_MODELSCOPE", "False"))
+    if use_modelscope:
+        from modelscope import MsDataset
+
+        dataset = MsDataset.load(args.dataset, split = "train")
+    else:
+        # Load and format dataset
+        # Support local JSON files
+        if args.dataset.endswith('.json') or os.path.isfile(args.dataset):
+            dataset = load_dataset("json", data_files={"train": args.dataset}, split="train")
+        else:
+            dataset = load_dataset(args.dataset, split = "train")
+    
+    # Check if dataset already has "text" field (inference format, not alpaca)
+    training_formatting_func = None
+    training_dataset_text_field = None
+    
+    if "text" in dataset.column_names:
+        # Dataset already has text field in inference format - use it directly
+        print("Training data already has 'text' field in inference format - using directly!")
+        def add_eos_token(examples):
+            texts = examples["text"]
+            return {"text": [text + EOS_TOKEN for text in texts]}
+        dataset = dataset.map(add_eos_token, batched = True)
+        training_dataset_text_field = "text"
+        training_formatting_func = None  # No formatting needed, use text field directly
+    else:
+        # Dataset has instruction/input/output - use alpaca format
+        alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+        def formatting_prompts_func(examples):
+            instructions = examples["instruction"]
+            inputs = examples["input"]
+            outputs = examples["output"]
+            texts = []
+            for instruction, input, output in zip(instructions, inputs, outputs):
+                text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
+                texts.append(text)
+            return {"text": texts}
+        dataset = dataset.map(formatting_prompts_func, batched = True)
+        training_dataset_text_field = "text"
+        training_formatting_func = None  # Already formatted in map
+    print("Training data is formatted and ready!")
+
+    # Load evaluation dataset if provided
+    eval_dataset = None
+    if args.eval_dataset:
+        if args.eval_dataset.endswith('.json') or os.path.isfile(args.eval_dataset):
+            eval_dataset = load_dataset("json", data_files={"train": args.eval_dataset}, split="train")
+        else:
+            eval_dataset = load_dataset(args.eval_dataset, split = "train")
+        
+        # Eval dataset uses instruction/input/output format (for callback compatibility)
+        alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+        def formatting_prompts_func(examples):
+            instructions = examples["instruction"]
+            inputs = examples["input"]
+            outputs = examples["output"]
+            texts = []
+            for instruction, input, output in zip(instructions, inputs, outputs):
+                text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
+                texts.append(text)
+            return {"text": texts}
+        eval_dataset = eval_dataset.map(formatting_prompts_func, batched = True)
+        print("Evaluation data is formatted and ready!")
+
+    # Configure wandb if using it
+    wandb_initialized = False
+    if args.report_to == "wandb" or (isinstance(args.report_to, list) and "wandb" in args.report_to):
+        if args.wandb_entity or args.wandb_project or args.wandb_run_name:
+            import wandb
+            wandb.init(
+                entity=args.wandb_entity,
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                resume="allow",
+            )
+            wandb_initialized = True
+
+    # Configure training arguments
+    training_args = SFTConfig(
+        per_device_train_batch_size = args.per_device_train_batch_size,
+        gradient_accumulation_steps = args.gradient_accumulation_steps,
+        warmup_steps = args.warmup_steps,
+        max_steps = args.max_steps,
+        learning_rate = args.learning_rate,
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        logging_steps = args.logging_steps,
+        optim = args.optim,
+        weight_decay = args.weight_decay,
+        lr_scheduler_type = args.lr_scheduler_type,
+        seed = args.seed,
+        output_dir = args.output_dir,
+        report_to = args.report_to,
+        max_length = args.max_seq_length,
+        dataset_num_proc = 2,
+        packing = False,
+        dataset_text_field = training_dataset_text_field,  # Use "text" field if available
+        # Evaluation settings
+        # Disable standard Trainer evaluation - we use custom callback for evaluation
+        # This avoids processing the entire eval dataset (4320 samples) unnecessarily
+        eval_strategy = "no",  # Disable Trainer's standard eval, use custom callback instead
+        eval_steps = None,
+        per_device_eval_batch_size = None,
+        # Checkpoint saving settings
+        save_strategy = args.save_strategy,
+        save_steps = args.save_steps if args.save_strategy == "steps" else None,
+        save_total_limit = args.save_total_limit,
+    )
+
+    # Create custom callback for logging completions to wandb
+    if wandb_initialized:
+        from transformers import TrainerCallback
+        import wandb
+        
+        class CompletionsCallback(TrainerCallback):
+            def __init__(self, model, tokenizer, train_dataset, eval_dataset, eval_steps=25):
+                self.model = model
+                self.tokenizer = tokenizer
+                self.train_dataset = train_dataset
+                self.eval_dataset = eval_dataset
+                self.logged_steps = set()  # Track which steps we've already logged to avoid duplicates
+                self.trainer = None  # Will be set in on_train_begin
+                self.eval_steps = eval_steps  # Store eval_steps from command-line args
+                # Track duplicate graph statistics
+                self.duplicate_stats = {
+                    "total_prompts": 0,
+                    "prompts_with_query_duplicate": 0,
+                    "prompts_with_example_duplicates": 0,
+                    "prompts_with_insufficient_distinct": 0,
+                }
+                # Track globally used graphs to ensure NO reuse across all queries
+                self.used_graph_hashes = set()  # Set of graph hashes that have been used (as query or example)
+                
+                # Check if dataset has curriculum_stage field
+                has_curriculum = False
+                if len(train_dataset) > 0:
+                    sample = train_dataset[0]
+                    if isinstance(sample, dict) and "curriculum_stage" in sample:
+                        has_curriculum = True
+                
+                if has_curriculum:
+                    # Don't sample from train dataset - only eval dataset
+                    print("\n📊 Sampling completions for curriculum stages:")
+                    self.train_samples = []  # No train dataset sampling
+                    if eval_dataset and len(eval_dataset) > 0:
+                        print("   Validation set:")
+                        # Sample 50 per stage from eval dataset
+                        self.eval_all_indices = self._sample_from_curriculum_stages(eval_dataset, samples_per_stage=50)
+                        print(f"   Will log {len(self.eval_all_indices)} eval completions during evaluation (50 per stage)")
+                        # No separate preview samples needed
+                        self.eval_samples = []
+                    else:
+                        self.eval_samples = []
+                        self.eval_all_indices = []
+                    print(f"   Total: {len(self.train_samples)} train samples, {len(self.eval_all_indices) if hasattr(self, 'eval_all_indices') else 0} eval samples\n")
+                else:
+                    # For hidden rule learning: eval dataset has pre-formatted prompts
+                    # First 50: 0-shot prompts, Next 50: 4-shot prompts, Next 50: 6-shot prompts (same queries)
+                    self.train_samples = random.sample(range(len(train_dataset)), min(5, len(train_dataset))) if len(train_dataset) > 0 else []
+                    self.eval_samples = list(range(min(5, len(eval_dataset)))) if eval_dataset and len(eval_dataset) > 0 else []
+                    
+                    if eval_dataset and len(eval_dataset) > 0:
+                        # Eval dataset structure: first 50 are 0-shot, next 50 are 4-shot, next 50 are 6-shot (same queries)
+                        num_queries = 50
+                        self.eval_0shot_indices = list(range(min(num_queries, len(eval_dataset) // 3)))
+                        self.eval_4shot_indices = list(range(num_queries, min(num_queries * 2, len(eval_dataset) * 2 // 3)))
+                        self.eval_6shot_indices = list(range(num_queries * 2, min(num_queries * 3, len(eval_dataset))))
+                        self.eval_all_indices = self.eval_0shot_indices + self.eval_4shot_indices + self.eval_6shot_indices
+                        
+                        print(f"   Will log {len(self.eval_0shot_indices)} 0-shot completions")
+                        print(f"   Will log {len(self.eval_4shot_indices)} 4-shot completions")
+                        print(f"   Will log {len(self.eval_6shot_indices)} 6-shot completions")
+                        print(f"   Total: {len(self.eval_all_indices)} eval completions")
+                        print(f"   HIDDEN RULE: Model must infer rule from examples")
+                    else:
+                        self.eval_0shot_indices = []
+                        self.eval_4shot_indices = []
+                        self.eval_6shot_indices = []
+                        self.eval_all_indices = []
+            
+            def _sample_from_curriculum_stages(self, dataset, total_samples=25, samples_per_stage=None):
+                """Sample examples from each curriculum stage.
+                
+                Args:
+                    dataset: The dataset to sample from
+                    total_samples: Total number of samples to return (distributed across stages)
+                    samples_per_stage: If provided, samples this many per stage (ignores total_samples)
+                """
+                if len(dataset) == 0:
+                    return []
+                
+                # Group indices by curriculum stage
+                stage_indices = {}
+                for idx in range(len(dataset)):
+                    sample = dataset[idx]
+                    if isinstance(sample, dict) and "curriculum_stage" in sample:
+                        stage = sample["curriculum_stage"]
+                        if stage not in stage_indices:
+                            stage_indices[stage] = []
+                        stage_indices[stage].append(idx)
+                
+                # If samples_per_stage is provided, use old behavior
+                if samples_per_stage is not None:
+                    samples = []
+                    for stage, indices in sorted(stage_indices.items()):
+                        if len(indices) >= samples_per_stage:
+                            sampled = random.sample(indices, samples_per_stage)
+                            samples.extend(sampled)
+                            print(f"   {stage}: sampled {samples_per_stage} indices ({len(indices)} total)")
+                        elif len(indices) > 0:
+                            samples.extend(indices)
+                            print(f"   {stage}: only {len(indices)} samples available, sampled all")
+                    return samples
+                
+                # Otherwise, distribute total_samples across stages evenly
+                num_stages = len(stage_indices)
+                if num_stages == 0:
+                    return []
+                
+                samples_per_stage_rounded = max(1, total_samples // num_stages)
+                remainder = total_samples % num_stages
+                
+                samples = []
+                for i, (stage, indices) in enumerate(sorted(stage_indices.items())):
+                    # Distribute remainder across first few stages
+                    num_to_sample = samples_per_stage_rounded + (1 if i < remainder else 0)
+                    num_to_sample = min(num_to_sample, len(indices))
+                    
+                    if num_to_sample > 0:
+                        sampled = random.sample(indices, num_to_sample)
+                        samples.extend(sampled)
+                        print(f"   {stage}: sampled {num_to_sample} indices ({len(indices)} total)")
+                
+                return samples
+            
+            def _extract_instruction_and_output(self, text):
+                """Extract instruction/input and output from formatted text"""
+                # The text is formatted as: instruction + input + response
+                # We need to extract the instruction part and the output part
+                if "### Instruction:" in text and "### Response:" in text:
+                    parts = text.split("### Response:")
+                    instruction = parts[0].replace("### Instruction:", "").replace("### Input:", "").strip()
+                    output = parts[1].strip() if len(parts) > 1 else ""
+                    return instruction, output
+                return text
+            
+            def _parse_path_from_output(self, text):
+                """Parse shortest path from model output - looks for brackets after 'Final Answer'"""
+                # Find "Final Answer" (case insensitive) and extract first brackets after it
+                final_answer_idx = text.lower().find("final answer")
+                if final_answer_idx != -1:
+                    # Look for brackets in the text starting from "Final Answer"
+                    remaining_text = text[final_answer_idx:]
+                    bracket_match = re.search(r'\[([-\d,\s]+)\]', remaining_text)
+                    if bracket_match:
+                        try:
+                            numbers = [int(item.strip()) for item in bracket_match.group(1).split(",") if item.strip()]
+                            # Only return if it looks like a valid path (at least 2 nodes)
+                            if len(numbers) >= 2:
+                                return numbers
+                        except ValueError:
+                            pass
+                
+                # Fallback: use last set of brackets (backward compatibility)
+                all_matches = re.findall(r'\[([-\d,\s]+)\]', text)
+                if all_matches:
+                    last_match = all_matches[-1]
+                    try:
+                        numbers = [int(item.strip()) for item in last_match.split(",") if item.strip()]
+                        if len(numbers) >= 2:
+                            return numbers
+                    except ValueError:
+                        pass
+                
+                return None
+            
+            def _extract_ground_truth_path(self, output_text):
+                """Extract ground truth shortest path from output text"""
+                # Look for "Final Answer: The shortest path ... is [0, 1, 2]"
+                match = re.search(r'is\s+(\[[\d,\s]+\])', output_text)
+                if match:
+                    try:
+                        path = json.loads(match.group(1))
+                        if isinstance(path, list):
+                            return path
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                # Try to find any JSON array
+                match = re.search(r'\[([\d,\s]+)\]', output_text)
+                if match:
+                    try:
+                        numbers = [int(item.strip()) for item in match.group(1).split(",") if item.strip()]
+                        return numbers
+                    except ValueError:
+                        pass
+                return None
+            
+            def _generate_prediction_batch(self, instruction_texts):
+                """Generate predictions for multiple prompts in batch (much faster)"""
+                try:
+                    # Extract just the instruction part (before Response) for each prompt
+                    prompts = []
+                    for instruction_text in instruction_texts:
+                        if "### Response:" in instruction_text:
+                            prompt = instruction_text.split("### Response:")[0] + "### Response:"
+                        else:
+                            prompt = instruction_text
+                        prompts.append(prompt)
+                    
+                    # Tokenize all prompts at once (batch processing)
+                    inputs = self.tokenizer(
+                        prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=args.max_seq_length - 50
+                    ).to(self.model.device)
+                    
+                    # Set model to eval mode for generation
+                    # CRITICAL: Ensure model is in eval mode to disable dropout, batch norm updates, etc.
+                    was_training = self.model.training
+                    self.model.eval()
+                    
+                    # Verify model is actually in eval mode
+                    assert not self.model.training, "Model should be in eval mode for generation!"
+                    
+                    pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                    eos_token_id = self.tokenizer.eos_token_id
+                    
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=256,  # 256 token limit
+                            do_sample=True,  # Sampling with temperature for more diverse outputs
+                            temperature=0.7,  # Moderate temperature for balanced randomness
+                            pad_token_id=pad_token_id,
+                            eos_token_id=eos_token_id,
+                        )
+                    
+                    # Restore training mode
+                    if was_training:
+                        self.model.train()
+                    
+                    # Decode all outputs
+                    generated_texts = []
+                    input_lengths = inputs['input_ids'].shape[1]
+                    for i, output in enumerate(outputs):
+                        # Decode only the new tokens (skip the prompt)
+                        generated_text = self.tokenizer.decode(
+                            output[input_lengths:], 
+                            skip_special_tokens=True
+                        )
+                        generated_texts.append(generated_text.strip())
+                    
+                    return generated_texts
+                except Exception as e:
+                    # Return error for all if batch fails
+                    return [f"Error: {str(e)}"] * len(instruction_texts)
+            
+            def _generate_prediction(self, instruction_text):
+                """Generate prediction for single prompt (backward compatibility)"""
+                results = self._generate_prediction_batch([instruction_text])
+                return results[0] if results else "Error: Generation failed"
+            
+            def _graphs_are_same(self, sample1, sample2):
+                """Check if two samples have the same adjacency matrix."""
+                if not (isinstance(sample1, dict) and isinstance(sample2, dict)):
+                    return False
+                if "adjacency_matrix" not in sample1 or "adjacency_matrix" not in sample2:
+                    return False
+                adj1 = sample1["adjacency_matrix"]
+                adj2 = sample2["adjacency_matrix"]
+                # Compare adjacency matrices
+                if len(adj1) != len(adj2):
+                    return False
+                for i in range(len(adj1)):
+                    if len(adj1[i]) != len(adj2[i]):
+                        return False
+                    for j in range(len(adj1[i])):
+                        if adj1[i][j] != adj2[i][j]:
+                            return False
+                return True
+            
+            def _select_distinct_examples(self, query_sample, example_samples, num_examples=3, used_graph_hashes=None):
+                """Select distinct examples that are different from the query, from each other, and from globally used graphs.
+                
+                Args:
+                    query_sample: The query sample
+                    example_samples: Pool of candidate examples to choose from
+                    num_examples: Number of examples needed
+                    used_graph_hashes: Set of graph hashes that have been used globally (to ensure no reuse)
+                
+                Returns:
+                    Tuple of (list of distinct example samples, dict with stats about duplicates)
+                """
+                distinct_examples = []
+                seen_graphs = set()
+                stats = {
+                    "query_duplicate_found": False,
+                    "example_duplicates_skipped": 0,
+                    "insufficient_distinct": False,
+                }
+                
+                if used_graph_hashes is None:
+                    used_graph_hashes = set()
+                
+                # Create a hash of the query graph to exclude it
+                query_graph_hash = None
+                if isinstance(query_sample, dict) and "adjacency_matrix" in query_sample:
+                    query_graph_hash = hashlib.md5(str(query_sample["adjacency_matrix"]).encode()).hexdigest()
+                    seen_graphs.add(query_graph_hash)
+                
+                for example in example_samples:
+                    if len(distinct_examples) >= num_examples:
+                        break
+                    
+                    # Get graph hash for this example
+                    example_graph_hash = hashlib.md5(str(example.get("adjacency_matrix", [])).encode()).hexdigest()
+                    
+                    # Check if this example is the same as the query
+                    if self._graphs_are_same(query_sample, example):
+                        stats["query_duplicate_found"] = True
+                        continue
+                    
+                    # Check if this graph has been used globally (NO REUSE)
+                    if example_graph_hash in used_graph_hashes:
+                        stats["example_duplicates_skipped"] += 1
+                        continue
+                    
+                    # Check if this example is the same as any already selected example in this prompt
+                    is_duplicate = False
+                    if example_graph_hash in seen_graphs:
+                        # Double-check by comparing adjacency matrices
+                        for existing_example in distinct_examples:
+                            if self._graphs_are_same(example, existing_example):
+                                is_duplicate = True
+                                stats["example_duplicates_skipped"] += 1
+                                break
+                    
+                    if not is_duplicate:
+                        distinct_examples.append(example)
+                        seen_graphs.add(example_graph_hash)
+                
+                # Check if we got enough distinct examples
+                if len(distinct_examples) < num_examples:
+                    stats["insufficient_distinct"] = True
+                
+                return distinct_examples, stats
+            
+            def _build_icl_prompt(self, query_sample, example_samples, num_examples=3, used_graph_hashes=None):
+                """Build a few-shot ICL prompt from examples and query.
+                
+                Handles both standard format (X to Y) and set target format (X to any in set S).
+                
+                Ensures that:
+                1. Examples are distinct from the query
+                2. Examples are distinct from each other
+                3. Examples are not reused from globally used graphs (if used_graph_hashes provided)
+                
+                Returns:
+                    Tuple of (prompt string, stats dict about duplicates, list of selected example graphs)
+                """
+                parts = []
+                
+                # Check if this is avoid node format
+                is_avoid_node = isinstance(query_sample, dict) and "avoid_node" in query_sample
+                
+                # Add header (dynamic based on number of examples)
+                if num_examples == 1:
+                    parts.append("Below is an example. Later, you will be asked to solve a similar problem.\n")
+                else:
+                    parts.append(f"Below are {num_examples} examples. Later, you will be asked to solve a similar problem.\n")
+                
+                # Select distinct examples (different from query, from each other, and from globally used graphs)
+                distinct_examples, duplicate_stats = self._select_distinct_examples(query_sample, example_samples, num_examples, used_graph_hashes)
+                
+                # Add examples with answers
+                for idx, example in enumerate(distinct_examples):
+                    if isinstance(example, dict) and "adjacency_matrix" in example:
+                        adjacency = json.dumps(example["adjacency_matrix"])
+                        
+                        # Check if example is also avoid node format
+                        example_is_avoid = "avoid_node" in example
+                        
+                        if example_is_avoid:
+                            # Avoid node format
+                            parts.append(
+                                f"Example {idx + 1}:\n"
+                                f"Graph representation: {adjacency}\n"
+                                f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                                f"Find the shortest path from node {example['start_node']} to node {example['end_node']} that avoids node {example['avoid_node']}.\n"
+                                "Nodes are indexed from 0.\n"
+                            )
+                        else:
+                            # Standard format
+                            parts.append(
+                                f"Example {idx + 1}:\n"
+                                f"Graph representation: {adjacency}\n"
+                                f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                                f"Find the shortest path from node {example['start_node']} to node {example['end_node']}.\n"
+                                "Nodes are indexed from 0.\n"
+                            )
+                        
+                        if example.get('reasoning_steps'):
+                            reasoning_text = "\n".join(example['reasoning_steps'])
+                            parts.append(
+                                f"I'll find the shortest path using Dijkstra's algorithm:\n\n"
+                                f"{reasoning_text}\n\n"
+                            )
+                        
+                        parts.append(
+                            f"Final Answer: {json.dumps(example.get('shortest_path', []))} with a total distance of {example.get('total_distance', 'unknown')}.\n"
+                        )
+                
+                # Add separator
+                parts.append("\nNow, here is a question for you to solve:\n")
+                
+                # Add query
+                if isinstance(query_sample, dict) and "adjacency_matrix" in query_sample:
+                    adjacency = json.dumps(query_sample["adjacency_matrix"])
+                    
+                    if is_avoid_node:
+                        # Avoid node format
+                        parts.append(
+                            f"Question:\n"
+                            f"Graph representation: {adjacency}\n"
+                            f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                            f"Find the shortest path from node {query_sample['start_node']} to node {query_sample['end_node']} that avoids node {query_sample['avoid_node']}.\n"
+                            "Nodes are indexed from 0.\n"
+                            "Use Dijkstra's algorithm to compute the shortest path for the question graph.\n"
+                            "You must end your response with 'Final Answer: [path] with a total distance of [total]' where [path] is the shortest path as a list of node indices and [total] is the total distance."
+                        )
+                    else:
+                        # Standard format
+                        parts.append(
+                            f"Question:\n"
+                            f"Graph representation: {adjacency}\n"
+                            f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                            f"Find the shortest path from node {query_sample['start_node']} to node {query_sample['end_node']}.\n"
+                            "Nodes are indexed from 0.\n"
+                            "Use Dijkstra's algorithm to compute the shortest path for the question graph.\n"
+                            "You must end your response with 'Final Answer: [path] with a total distance of [total]' where [path] is the shortest path as a list of node indices and [total] is the total distance."
+                        )
+                
+                # Return prompt, stats, and list of selected example graphs (for tracking)
+                selected_graph_hashes = []
+                for ex in distinct_examples:
+                    if isinstance(ex, dict) and "adjacency_matrix" in ex:
+                        selected_graph_hashes.append(hashlib.md5(str(ex["adjacency_matrix"]).encode()).hexdigest())
+                
+                return "\n".join(parts), duplicate_stats, selected_graph_hashes
+            
+            def _build_zero_shot_prompt(self, query_sample):
+                """Build a zero-shot prompt (no examples)."""
+                if isinstance(query_sample, dict) and "adjacency_matrix" in query_sample:
+                    adjacency = json.dumps(query_sample["adjacency_matrix"])
+                    
+                    # Check if this is avoid node format
+                    is_avoid_node = "avoid_node" in query_sample
+                    
+                    if is_avoid_node:
+                        # Avoid node format
+                        return (
+                            f"Graph representation: {adjacency}\n"
+                            f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                            f"Find the shortest path from node {query_sample['start_node']} to node {query_sample['end_node']} that avoids node {query_sample['avoid_node']}.\n"
+                            "Nodes are indexed from 0.\n"
+                            "You must end your response with 'Final Answer: [path] with a total distance of [total]' "
+                            "where [path] is the shortest path as a list of node indices and [total] is the total distance."
+                        )
+                    else:
+                        # Standard format
+                        return (
+                            f"Graph representation: {adjacency}\n"
+                            f"This is an adjacency matrix where 0 means no edge exists, and a positive number represents the edge weight.\n"
+                            f"Find the shortest path from node {query_sample['start_node']} to node {query_sample['end_node']}.\n"
+                            "Nodes are indexed from 0.\n"
+                            "You must end your response with 'Final Answer: [path] with a total distance of [total]' "
+                            "where [path] is the shortest path as a list of node indices and [total] is the total distance."
+                        )
+                return ""
+            
+            def _log_completions_table(self, dataset, sample_indices, table_name, step, use_icl=True, icl_examples=None, num_icl_examples=3):
+                """Log completions table to wandb with accuracy calculation.
+                
+                Args:
+                    dataset: The dataset to evaluate
+                    sample_indices: Indices of samples to evaluate
+                    table_name: Name for the wandb table
+                    step: Training step
+                    use_icl: If True, use few-shot ICL prompts; if False, use zero-shot prompts
+                    icl_examples: List of example samples to use for ICL (if use_icl=True)
+                    num_icl_examples: Number of examples to use in ICL prompt (default: 3)
+                """
+                if not sample_indices:
+                    return
+                
+                import wandb
+                import random
+                
+                # Prepare all samples for batch generation
+                # For ICL: use full dataset as example pool and track used graphs to ensure NO reuse
+                if use_icl:
+                    # Use full dataset as example pool (not just a small subset)
+                    example_pool = [dataset[i] for i in range(len(dataset)) if i not in sample_indices]
+                    if len(example_pool) == 0:
+                        # Fallback: use all dataset if no other samples available
+                        example_pool = [dataset[i] for i in range(len(dataset))]
+                
+                all_texts = []
+                all_samples = []
+                all_duplicate_stats = []
+                for idx in sample_indices:
+                    sample = dataset[idx]
+                    
+                    if use_icl:
+                        # Get query graph hash and mark it as used
+                        query_graph_hash = None
+                        if isinstance(sample, dict) and "adjacency_matrix" in sample:
+                            query_graph_hash = hashlib.md5(str(sample["adjacency_matrix"]).encode()).hexdigest()
+                            self.used_graph_hashes.add(query_graph_hash)
+                        
+                        # Build few-shot ICL prompt with NO reuse (pass used_graph_hashes)
+                        prompt, duplicate_stats, selected_graph_hashes = self._build_icl_prompt(
+                            sample, example_pool, num_examples=num_icl_examples, used_graph_hashes=self.used_graph_hashes
+                        )
+                        
+                        # Mark selected example graphs as used (NO REUSE)
+                        for graph_hash in selected_graph_hashes:
+                            self.used_graph_hashes.add(graph_hash)
+                        
+                        all_duplicate_stats.append(duplicate_stats)
+                        # Track duplicate statistics
+                        self.duplicate_stats["total_prompts"] += 1
+                        if duplicate_stats["query_duplicate_found"]:
+                            self.duplicate_stats["prompts_with_query_duplicate"] += 1
+                        if duplicate_stats["example_duplicates_skipped"] > 0:
+                            self.duplicate_stats["prompts_with_example_duplicates"] += 1
+                        if duplicate_stats["insufficient_distinct"]:
+                            self.duplicate_stats["prompts_with_insufficient_distinct"] += 1
+                    else:
+                        # Build zero-shot prompt
+                        prompt = self._build_zero_shot_prompt(sample)
+                        all_duplicate_stats.append(None)
+                    
+                    all_texts.append(prompt)
+                    all_samples.append((idx, sample))
+                
+                # Generate predictions in smaller batches to avoid OOM
+                # Process in chunks of 20 to stay within memory bounds
+                eval_batch_size = 20
+                print(f"   Generating {len(all_texts)} predictions in batches of {eval_batch_size}...")
+                prediction_texts = []
+                for i in range(0, len(all_texts), eval_batch_size):
+                    batch_texts = all_texts[i:i+eval_batch_size]
+                    batch_predictions = self._generate_prediction_batch(batch_texts)
+                    prediction_texts.extend(batch_predictions)
+                    print(f"      Completed {min(i+eval_batch_size, len(all_texts))}/{len(all_texts)} predictions...")
+                
+                # Process results
+                table_data = []
+                correct_count = 0
+                total_count = len(sample_indices)
+                
+                # Track accuracy per stage
+                stage_stats = {}  # {stage_name: {"correct": count, "total": count}}
+                
+                for i, ((idx, sample), prediction_text) in enumerate(zip(all_samples, prediction_texts)):
+                    # For true ICL, ground truth is in the sample dict, not in "text" field
+                    if isinstance(sample, dict) and "shortest_path" in sample:
+                        # True ICL format: sample has direct fields
+                        ground_truth_path = sample.get("shortest_path")
+                        instruction = all_texts[i]  # Use the prompt we built
+                        # Create ground_truth_text for display purposes
+                        if ground_truth_path is not None:
+                            ground_truth_text = f"Final Answer: {json.dumps(ground_truth_path)} with a total distance of {sample.get('total_distance', 'unknown')}."
+                        else:
+                            ground_truth_text = "N/A"
+                    else:
+                        # Original format: extract from "text" field
+                        text = sample.get("text", "")
+                        instruction, ground_truth_text = self._extract_instruction_and_output(text)
+                        ground_truth_path = self._extract_ground_truth_path(ground_truth_text)
+                    
+                    # Parse predicted path from model output
+                    predicted_path = self._parse_path_from_output(prediction_text)
+                    
+                    # Check if prediction matches ground truth
+                    is_correct = (predicted_path is not None and 
+                                ground_truth_path is not None and 
+                                predicted_path == ground_truth_path)
+                    
+                    if is_correct:
+                        correct_count += 1
+                    
+                    # Get curriculum stage or node size if available
+                    stage = None
+                    if isinstance(sample, dict) and "curriculum_stage" in sample:
+                        stage = sample["curriculum_stage"]
+                    elif isinstance(sample, dict) and "num_nodes" in sample:
+                        # For true ICL, use node size as stage identifier
+                        stage = f"size_{sample['num_nodes']}"
+                    # Use the raw stage name (e.g., "stage1_baby" or "size_5") for consistency
+                    stage_name = stage if stage else "unknown"
+                    
+                    # Track per-stage statistics
+                    if stage_name not in stage_stats:
+                        stage_stats[stage_name] = {"correct": 0, "total": 0}
+                    stage_stats[stage_name]["total"] += 1
+                    if is_correct:
+                        stage_stats[stage_name]["correct"] += 1
+                    
+                    table_data.append({
+                        "stage": stage_name,
+                        "sample_idx": idx,
+                        "instruction": instruction,  # No truncation - show full text
+                        "ground_truth_path": str(ground_truth_path) if ground_truth_path else "N/A",
+                        "predicted_path": str(predicted_path) if predicted_path else "N/A",
+                        "ground_truth_text": ground_truth_text,  # No truncation - show full text
+                        "prediction_text": prediction_text,  # No truncation - show full text
+                        "correct": is_correct,
+                    })
+                
+                # Calculate overall accuracy
+                accuracy = (correct_count / total_count * 100) if total_count > 0 else 0.0
+                
+                # Calculate accuracy per stage
+                stage_accuracies = {}
+                
+                # Build metrics dictionary - start with overall accuracy
+                wandb_log_dict = {
+                    f"accuracy/{table_name}": accuracy,
+                    f"accuracy/{table_name}_count": f"{correct_count}/{total_count}",
+                }
+                
+                # Add per-stage accuracy metrics
+                for stage_name, stats in sorted(stage_stats.items()):
+                    stage_correct = stats["correct"]
+                    stage_total = stats["total"]
+                    stage_accuracy = (stage_correct / stage_total * 100) if stage_total > 0 else 0.0
+                    stage_accuracies[stage_name] = stage_accuracy
+                    # Log per-stage accuracy to wandb - use sanitized stage name
+                    # Stage names are already in format like "stage1_baby", just ensure lowercase
+                    sanitized_stage = stage_name.lower().replace(' ', '_')
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}"] = stage_accuracy
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}_count"] = f"{stage_correct}/{stage_total}"
+                
+                # Create wandb table with accuracy information
+                table = wandb.Table(
+                    columns=["stage", "sample_idx", "ground_truth_path", "predicted_path", "correct", "instruction", "ground_truth_text", "prediction_text"], 
+                    data=[
+                        [row["stage"], row["sample_idx"], row["ground_truth_path"], row["predicted_path"], 
+                         row["correct"], row["instruction"], row["ground_truth_text"], row["prediction_text"]] 
+                        for row in table_data
+                    ]
+                )
+                # Make table name unique per step to avoid overwriting
+                # Tables in Wandb overwrite if same name is used, so include step number
+                log_step = int(step) if step is not None else 0
+                table_key = f"completions/{table_name}_step_{log_step}"
+                wandb_log_dict[table_key] = table
+                
+                # Also keep the main table name for latest view (will overwrite, but that's okay for "latest")
+                wandb_log_dict[f"completions/{table_name}"] = table
+                
+                # Log metrics using trainer.log() for proper step tracking (like PPO example)
+                # This ensures metrics are properly tracked in Trainer's log_history
+                metrics_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('accuracy/')}
+                
+                # Log tables separately via wandb.log (trainer.log doesn't handle tables well)
+                tables_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('completions/')}
+                
+                print(f"   📊 Logging to wandb at step {log_step}")
+                print(f"   📊 Metrics being logged: {list(metrics_only.keys())}")
+                print(f"   📊 Metrics values: {[(k, v) for k, v in metrics_only.items()]}")
+                print(f"   📊 Tables being logged: {list(tables_only.keys())}")
+                print(f"   📊 Trainer available: {self.trainer is not None}")
+                
+                # Log metrics - let Wandb handle step tracking automatically
+                # Don't specify step or commit - Wandb will use current step and handle commits
+                import wandb
+                
+                if metrics_only:
+                    print(f"   📊 Logging {len(metrics_only)} metrics to wandb...")
+                    wandb.log(metrics_only)
+                    print(f"   ✅ Metrics logged successfully")
+                
+                # For tables, let Wandb handle step tracking automatically
+                if tables_only:
+                    print(f"   📊 Logging {len(tables_only)} tables to wandb...")
+                    wandb.log(tables_only)
+                    print(f"   ✅ Tables logged successfully")
+                
+                # Print accuracy to console
+                print(f"\n📊 {table_name.upper()} Overall Accuracy: {correct_count}/{total_count} = {accuracy:.2f}%")
+                print(f"\n📊 {table_name.upper()} Accuracy by Stage:")
+                for stage_name in sorted(stage_accuracies.keys()):
+                    stats = stage_stats[stage_name]
+                    stage_acc = stage_accuracies[stage_name]
+                    print(f"   {stage_name}: {stats['correct']}/{stats['total']} = {stage_acc:.2f}%")
+                
+                # Print duplicate statistics if using ICL
+                if use_icl:
+                    total = self.duplicate_stats["total_prompts"]
+                    if total > 0:
+                        query_dup_pct = (self.duplicate_stats["prompts_with_query_duplicate"] / total * 100) if total > 0 else 0
+                        example_dup_pct = (self.duplicate_stats["prompts_with_example_duplicates"] / total * 100) if total > 0 else 0
+                        insufficient_pct = (self.duplicate_stats["prompts_with_insufficient_distinct"] / total * 100) if total > 0 else 0
+                        print(f"\n🔍 {table_name.upper()} Duplicate Graph Statistics:")
+                        print(f"   Total prompts built: {total}")
+                        print(f"   Prompts with query duplicate: {self.duplicate_stats['prompts_with_query_duplicate']} ({query_dup_pct:.1f}%)")
+                        print(f"   Prompts with example duplicates: {self.duplicate_stats['prompts_with_example_duplicates']} ({example_dup_pct:.1f}%)")
+                        print(f"   Prompts with insufficient distinct examples: {self.duplicate_stats['prompts_with_insufficient_distinct']} ({insufficient_pct:.1f}%)")
+            
+            def _log_completions_table_preformatted(self, dataset, sample_indices, table_name, step):
+                """Log completions for pre-formatted prompts (instruction field already has full prompt)."""
+                if not sample_indices:
+                    return
+                
+                import wandb
+                
+                # Extract prompts from instruction field
+                all_texts = []
+                all_samples = []
+                for idx in sample_indices:
+                    sample = dataset[idx]
+                    # Use instruction field which already has the full prompt
+                    instruction = sample.get("instruction", "")
+                    all_texts.append(instruction)
+                    all_samples.append((idx, sample))
+                
+                # Generate predictions in batches
+                eval_batch_size = 20
+                print(f"   Generating {len(all_texts)} predictions in batches of {eval_batch_size}...")
+                prediction_texts = []
+                for i in range(0, len(all_texts), eval_batch_size):
+                    batch_texts = all_texts[i:i+eval_batch_size]
+                    batch_predictions = self._generate_prediction_batch(batch_texts)
+                    prediction_texts.extend(batch_predictions)
+                    print(f"      Completed {min(i+eval_batch_size, len(all_texts))}/{len(all_texts)} predictions...")
+                
+                # Process results
+                table_data = []
+                correct_count = 0
+                total_count = len(sample_indices)
+                stage_stats = {}
+                
+                for i, ((idx, sample), prediction_text) in enumerate(zip(all_samples, prediction_texts)):
+                    # Ground truth is in the sample
+                    ground_truth_path = sample.get("shortest_path")
+                    instruction = all_texts[i]
+                    
+                    if ground_truth_path is not None:
+                        ground_truth_text = f"Final Answer: {json.dumps(ground_truth_path)} with a total distance of {sample.get('total_distance', 'unknown')}."
+                    else:
+                        ground_truth_text = "N/A"
+                    
+                    # Parse predicted path
+                    predicted_path = self._parse_path_from_output(prediction_text)
+                    
+                    # Check if prediction matches ground truth
+                    is_correct = (predicted_path is not None and 
+                                ground_truth_path is not None and 
+                                predicted_path == ground_truth_path)
+                    
+                    if is_correct:
+                        correct_count += 1
+                    
+                    # Get stage (avoid_node for eval)
+                    stage = None
+                    if isinstance(sample, dict) and "avoid_node" in sample:
+                        stage = f"avoid_node_{sample['avoid_node']}"
+                    elif isinstance(sample, dict) and "num_nodes" in sample:
+                        stage = f"size_{sample['num_nodes']}"
+                    stage_name = stage if stage else "unknown"
+                    
+                    if stage_name not in stage_stats:
+                        stage_stats[stage_name] = {"correct": 0, "total": 0}
+                    stage_stats[stage_name]["total"] += 1
+                    if is_correct:
+                        stage_stats[stage_name]["correct"] += 1
+                    
+                    table_data.append({
+                        "stage": stage_name,
+                        "sample_idx": idx,
+                        "instruction": instruction,
+                        "ground_truth_path": str(ground_truth_path) if ground_truth_path else "N/A",
+                        "predicted_path": str(predicted_path) if predicted_path else "N/A",
+                        "ground_truth_text": ground_truth_text,
+                        "prediction_text": prediction_text,
+                        "correct": is_correct,
+                    })
+                
+                # Calculate accuracy
+                accuracy = (correct_count / total_count * 100) if total_count > 0 else 0.0
+                stage_accuracies = {}
+                
+                wandb_log_dict = {
+                    f"accuracy/{table_name}": accuracy,
+                    f"accuracy/{table_name}_count": f"{correct_count}/{total_count}",
+                }
+                
+                for stage_name, stats in sorted(stage_stats.items()):
+                    stage_correct = stats["correct"]
+                    stage_total = stats["total"]
+                    stage_accuracy = (stage_correct / stage_total * 100) if stage_total > 0 else 0.0
+                    stage_accuracies[stage_name] = stage_accuracy
+                    sanitized_stage = stage_name.lower().replace(' ', '_')
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}"] = stage_accuracy
+                    wandb_log_dict[f"accuracy/{table_name}_{sanitized_stage}_count"] = f"{stage_correct}/{stage_total}"
+                
+                # Create wandb table
+                table = wandb.Table(
+                    columns=["stage", "sample_idx", "ground_truth_path", "predicted_path", "correct", "instruction", "ground_truth_text", "prediction_text"], 
+                    data=[
+                        [row["stage"], row["sample_idx"], row["ground_truth_path"], row["predicted_path"], 
+                         row["correct"], row["instruction"], row["ground_truth_text"], row["prediction_text"]] 
+                        for row in table_data
+                    ]
+                )
+                
+                log_step = int(step) if step is not None else 0
+                table_key = f"completions/{table_name}_step_{log_step}"
+                wandb_log_dict[table_key] = table
+                wandb_log_dict[f"completions/{table_name}"] = table
+                
+                metrics_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('accuracy/')}
+                tables_only = {k: v for k, v in wandb_log_dict.items() if k.startswith('completions/')}
+                
+                print(f"   📊 Logging to wandb at step {log_step}")
+                
+                import wandb
+                if metrics_only:
+                    wandb.log(metrics_only)
+                if tables_only:
+                    wandb.log(tables_only)
+                
+                print(f"\n📊 {table_name.upper()} Overall Accuracy: {correct_count}/{total_count} = {accuracy:.2f}%")
+                print(f"\n📊 {table_name.upper()} Accuracy by Stage:")
+                for stage_name in sorted(stage_accuracies.keys()):
+                    stats = stage_stats[stage_name]
+                    stage_acc = stage_accuracies[stage_name]
+                    print(f"   {stage_name}: {stats['correct']}/{stats['total']} = {stage_acc:.2f}%")
+            
+            def on_train_begin(self, args, state, control, **kwargs):
+                """Store trainer reference at training start"""
+                # Store trainer reference for logging
+                self.trainer = kwargs.get("trainer")
+                # Note: We don't log here - we'll log at step 0 in on_evaluate instead
+                # This avoids timing issues where Wandb has already moved past step 0
+            
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                """Store trainer reference when available (not used for evaluation logging)"""
+                # Store trainer reference if available (for potential future use)
+                if self.trainer is None:
+                    self.trainer = kwargs.get("trainer")
+                # Note: We don't log evaluation metrics here - only in on_evaluate
+                # This avoids timing issues where state.global_step has advanced past the eval step
+            
+            def on_step_end(self, args, state, control, **kwargs):
+                """Log ground truth accuracy metrics and completions at evaluation steps"""
+                # Store trainer reference if available
+                if self.trainer is None:
+                    self.trainer = kwargs.get("trainer")
+                
+                # Check if this is an evaluation step (every eval_steps, or step 0)
+                # Use the eval_steps stored in callback (from command-line args)
+                eval_steps = self.eval_steps
+                
+                # Only run evaluation at step 0 and every eval_steps
+                if state.global_step % eval_steps != 0 and state.global_step != 0:
+                    return
+                
+                # This is an evaluation step
+                eval_step = state.global_step
+                
+                # Skip if we've already logged at this step (shouldn't happen, but safety check)
+                if eval_step in self.logged_steps:
+                    print(f"⏭️  Skipping duplicate log at step {eval_step} (already logged)")
+                    return
+                
+                print(f"\n🔍 Running custom evaluation at step {eval_step}")
+                print(f"   hasattr(self, 'eval_all_indices'): {hasattr(self, 'eval_all_indices')}")
+                if hasattr(self, 'eval_all_indices'):
+                    print(f"   eval_all_indices: {self.eval_all_indices[:5] if self.eval_all_indices else None}... (length: {len(self.eval_all_indices) if self.eval_all_indices else 0})")
+                print(f"   eval_dataset exists: {self.eval_dataset is not None}")
+                
+                # Log eval completions and accuracy metrics (50 per stage)
+                # This logs both the completions table AND the accuracy metrics
+                if hasattr(self, 'eval_all_indices') and self.eval_all_indices and self.eval_dataset:
+                    print(f"\n📊 Logging {len(self.eval_all_indices)} eval completions and accuracy metrics to wandb...")
+                    try:
+                        # Check if this is true ICL dataset (has adjacency_matrix field, not text field)
+                        is_true_icl = (len(self.eval_dataset) > 0 and 
+                                     isinstance(self.eval_dataset[0], dict) and 
+                                     "adjacency_matrix" in self.eval_dataset[0])
+                        
+                        # For hidden rule learning: eval dataset has pre-formatted prompts
+                        if hasattr(self, 'eval_0shot_indices') and hasattr(self, 'eval_4shot_indices') and hasattr(self, 'eval_6shot_indices'):
+                            print(f"\n📊 HIDDEN RULE EVALUATION: Testing 0-shot, 4-shot, and 6-shot prompts...")
+                            print(f"   Rule: Avoid node (hidden)")
+                            
+                            # Test 0-shot (pre-formatted prompts)
+                            if self.eval_0shot_indices:
+                                print(f"   Testing 0-SHOT prompts...")
+                                self._log_completions_table_preformatted(
+                                    self.eval_dataset,
+                                    self.eval_0shot_indices,
+                                    "val_0shot",
+                                    eval_step
+                                )
+                            
+                            # Test 4-shot (pre-formatted prompts)
+                            if self.eval_4shot_indices:
+                                print(f"   Testing 4-SHOT prompts...")
+                                self._log_completions_table_preformatted(
+                                    self.eval_dataset,
+                                    self.eval_4shot_indices,
+                                    "val_4shot",
+                                    eval_step
+                                )
+                            
+                            # Test 6-shot (pre-formatted prompts)
+                            if self.eval_6shot_indices:
+                                print(f"   Testing 6-SHOT prompts...")
+                                self._log_completions_table_preformatted(
+                                    self.eval_dataset,
+                                    self.eval_6shot_indices,
+                                    "val_6shot",
+                                    eval_step
+                                )
+                        elif is_true_icl:
+                            # Original format: use text field (already has examples in prompt)
+                            self._log_completions_table(
+                                self.eval_dataset, 
+                                self.eval_all_indices, 
+                                "val", 
+                                eval_step,
+                                use_icl=False,  # Original format already has examples in text
+                                icl_examples=None
+                            )
+                        
+                        self.logged_steps.add(eval_step)
+                        print(f"✅ Successfully logged completions and accuracy metrics at step {eval_step}")
+                    except Exception as e:
+                        print(f"❌ Error logging completions at step {eval_step}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                elif self.eval_samples and self.eval_dataset:
+                    # Fallback if eval_all_indices not available
+                    print(f"📊 Using fallback eval_samples (length: {len(self.eval_samples)})")
+                    self._log_completions_table(
+                        self.eval_dataset, 
+                        self.eval_samples, 
+                        "val", 
+                        eval_step,
+                        use_icl=False,
+                        icl_examples=None
+                    )
+                    self.logged_steps.add(eval_step)
+                else:
+                    print(f"⚠️  No eval samples available to log! eval_all_indices={hasattr(self, 'eval_all_indices')}, eval_samples={len(self.eval_samples) if hasattr(self, 'eval_samples') else 'N/A'}")
+            
+            def on_evaluate(self, args, state, control, logs=None, **kwargs):
+                """This won't be called since eval_strategy='no', but kept for compatibility"""
+                pass
+        
+        completions_callback = CompletionsCallback(model, tokenizer, dataset, eval_dataset, eval_steps=args.eval_steps if hasattr(args, 'eval_steps') and args.eval_steps else 25)
+        callbacks = [completions_callback]
+    else:
+        callbacks = None
+    
+    # Initialize trainer with shuffle control for curriculum learning
+    class CurriculumSFTTrainer(SFTTrainer):
+        def get_train_dataloader(self):
+            """Override to control shuffling based on args.dataloader_shuffle"""
+            if self.train_dataset is None:
+                raise ValueError("Trainer: training requires a train_dataset.")
+            
+            train_dataset = self.train_dataset
+            if hasattr(train_dataset, "__len__") and len(train_dataset) == 0:
+                raise ValueError("Trainer: train_dataset must have a length > 0.")
+            
+            # Import here to avoid circular imports
+            from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
+            
+            # Use SequentialSampler if shuffle is disabled, RandomSampler if enabled
+            if args.dataloader_shuffle:
+                train_sampler = RandomSampler(train_dataset)
+                print("🔄 Using RandomSampler - data will be shuffled each epoch")
+            else:
+                train_sampler = SequentialSampler(train_dataset)
+                print("🔄 Using SequentialSampler - data order preserved (curriculum)")
+                
+                # Verify order by checking first few samples
+                if len(train_dataset) >= 3:
+                    try:
+                        sample_0 = train_dataset[0]
+                        sample_1 = train_dataset[1]
+                        sample_2 = train_dataset[2]
+                        if isinstance(sample_0, dict) and "instruction" in sample_0:
+                            print(f"   ✓ Verified: Sample 0 curriculum_stage = {sample_0.get('curriculum_stage', 'N/A')}")
+                            print(f"   ✓ Verified: Sample 1 curriculum_stage = {sample_1.get('curriculum_stage', 'N/A')}")
+                            print(f"   ✓ Verified: Sample 2 curriculum_stage = {sample_2.get('curriculum_stage', 'N/A')}")
+                    except Exception as e:
+                        print(f"   ⚠️  Could not verify sample order: {e}")
+            
+            # CRITICAL: When using a sampler, shuffle parameter is ignored
+            # SequentialSampler = no shuffling, RandomSampler = shuffling
+            return DataLoader(
+                train_dataset,
+                batch_size=self.args.per_device_train_batch_size,
+                sampler=train_sampler,  # This controls order - SequentialSampler preserves order
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+            )
+    
+    trainer = CurriculumSFTTrainer(
+        model = model,
+        processing_class = tokenizer,
+        train_dataset = dataset,
+        eval_dataset = eval_dataset,
+        args = training_args,
+        callbacks = callbacks,
+        formatting_func = training_formatting_func,  # None if using text field directly
+    )
+
+    # Train model
+    trainer_stats = trainer.train()
+
+    # Save model
+    if args.save_model:
+        # if args.quantization_method is a list, we will save the model for each quantization method
+        if args.save_gguf:
+            if isinstance(args.quantization, list):
+                for quantization_method in args.quantization:
+                    print(
+                        f"Saving model with quantization method: {quantization_method}"
+                    )
+                    model.save_pretrained_gguf(
+                        args.save_path,
+                        tokenizer,
+                        quantization_method = quantization_method,
+                    )
+                    if args.push_model:
+                        model.push_to_hub_gguf(
+                            hub_path = args.hub_path,
+                            hub_token = args.hub_token,
+                            quantization_method = quantization_method,
+                        )
+            else:
+                print(f"Saving model with quantization method: {args.quantization}")
+                model.save_pretrained_gguf(
+                    args.save_path, tokenizer, quantization_method = args.quantization
+                )
+                if args.push_model:
+                    model.push_to_hub_gguf(
+                        hub_path = args.hub_path,
+                        hub_token = args.hub_token,
+                        quantization_method = quantization_method,
+                    )
+        else:
+            model.save_pretrained_merged(args.save_path, tokenizer, args.save_method)
+            if args.push_model:
+                model.push_to_hub_merged(args.save_path, tokenizer, args.hub_token)
+    else:
+        print("Warning: The model is not saved!")
+
+
+if __name__ == "__main__":
+    # Define argument parser
+    parser = argparse.ArgumentParser(
+        description = "🦥 Fine-tune your llm faster using unsloth!"
+    )
+
+    model_group = parser.add_argument_group("🤖 Model Options")
+    model_group.add_argument(
+        "--model_name",
+        type = str,
+        default = "unsloth/llama-3-8b",
+        help = "Model name to load",
+    )
+    model_group.add_argument(
+        "--max_seq_length",
+        type = int,
+        default = 2048,
+        help = "Maximum sequence length, default is 2048. We auto support RoPE Scaling internally!",
+    )
+    model_group.add_argument(
+        "--dtype",
+        type = str,
+        default = None,
+        help = "Data type for model (None for auto detection)",
+    )
+    model_group.add_argument(
+        "--load_in_4bit",
+        action = "store_true",
+        help = "Use 4bit quantization to reduce memory usage",
+    )
+    model_group.add_argument(
+        "--dataset",
+        type = str,
+        default = "yahma/alpaca-cleaned",
+        help = "Huggingface dataset or local JSON file to use for training",
+    )
+    model_group.add_argument(
+        "--eval_dataset",
+        type = str,
+        default = None,
+        help = "Huggingface dataset or local JSON file to use for evaluation (optional)",
+    )
+
+    lora_group = parser.add_argument_group(
+        "🧠 LoRA Options", "These options are used to configure the LoRA model."
+    )
+    lora_group.add_argument(
+        "--r",
+        type = int,
+        default = 16,
+        help = "Rank for Lora model, default is 16.  (common values: 8, 16, 32, 64, 128)",
+    )
+    lora_group.add_argument(
+        "--lora_alpha",
+        type = int,
+        default = 16,
+        help = "LoRA alpha parameter, default is 16. (common values: 8, 16, 32, 64, 128)",
+    )
+    lora_group.add_argument(
+        "--lora_dropout",
+        type = float,
+        default = 0.0,
+        help = "LoRA dropout rate, default is 0.0 which is optimized.",
+    )
+    lora_group.add_argument(
+        "--bias", type = str, default = "none", help = "Bias setting for LoRA"
+    )
+    lora_group.add_argument(
+        "--use_gradient_checkpointing",
+        type = str,
+        default = "unsloth",
+        help = "Use gradient checkpointing",
+    )
+    lora_group.add_argument(
+        "--random_state",
+        type = int,
+        default = 3407,
+        help = "Random state for reproducibility, default is 3407.",
+    )
+    lora_group.add_argument(
+        "--use_rslora", action = "store_true", help = "Use rank stabilized LoRA"
+    )
+    lora_group.add_argument(
+        "--loftq_config", type = str, default = None, help = "Configuration for LoftQ"
+    )
+
+    training_group = parser.add_argument_group("🎓 Training Options")
+    training_group.add_argument(
+        "--per_device_train_batch_size",
+        type = int,
+        default = 2,
+        help = "Batch size per device during training, default is 2.",
+    )
+    training_group.add_argument(
+        "--gradient_accumulation_steps",
+        type = int,
+        default = 4,
+        help = "Number of gradient accumulation steps, default is 4.",
+    )
+    training_group.add_argument(
+        "--warmup_steps",
+        type = int,
+        default = 5,
+        help = "Number of warmup steps, default is 5.",
+    )
+    training_group.add_argument(
+        "--max_steps", type = int, default = 400, help = "Maximum number of training steps."
+    )
+    training_group.add_argument(
+        "--learning_rate",
+        type = float,
+        default = 2e-4,
+        help = "Learning rate, default is 2e-4.",
+    )
+    training_group.add_argument(
+        "--optim", type = str, default = "adamw_8bit", help = "Optimizer type."
+    )
+    training_group.add_argument(
+        "--weight_decay",
+        type = float,
+        default = 0.01,
+        help = "Weight decay, default is 0.01.",
+    )
+    training_group.add_argument(
+        "--lr_scheduler_type",
+        type = str,
+        default = "linear",
+        help = "Learning rate scheduler type, default is 'linear'.",
+    )
+    training_group.add_argument(
+        "--seed",
+        type = int,
+        default = 3407,
+        help = "Seed for reproducibility, default is 3407.",
+    )
+    training_group.add_argument(
+        "--eval_strategy",
+        type = str,
+        default = "steps",
+        choices = ["no", "steps", "epoch"],
+        help = "Evaluation strategy: 'no', 'steps', or 'epoch'. Default is 'steps'.",
+    )
+    training_group.add_argument(
+        "--eval_steps",
+        type = int,
+        default = 100,
+        help = "Run evaluation every N steps. Only used if eval_strategy='steps'. Default is 100.",
+    )
+    training_group.add_argument(
+        "--per_device_eval_batch_size",
+        type = int,
+        default = 2,
+        help = "Batch size per device for evaluation. Default is 2.",
+    )
+    training_group.add_argument(
+        "--save_strategy",
+        type = str,
+        default = "steps",
+        choices = ["no", "steps", "epoch"],
+        help = "Checkpoint saving strategy: 'no', 'steps', or 'epoch'. Default is 'steps'.",
+    )
+    training_group.add_argument(
+        "--save_steps",
+        type = int,
+        default = 500,
+        help = "Save checkpoint every N steps. Only used if save_strategy='steps'. Default is 500.",
+    )
+    training_group.add_argument(
+        "--save_total_limit",
+        type = int,
+        default = 3,
+        help = "Limit the total number of checkpoints. Older checkpoints are deleted. Default is 3.",
+    )
+    training_group.add_argument(
+        "--dataloader_shuffle",
+        action = "store_true",
+        help = "Shuffle training data. Default is False to preserve curriculum order.",
+    )
+
+    # Report/Logging arguments
+    report_group = parser.add_argument_group("📊 Report Options")
+    report_group.add_argument(
+        "--report_to",
+        type = str,
+        default = "tensorboard",
+        choices = [
+            "azure_ml",
+            "clearml",
+            "codecarbon",
+            "comet_ml",
+            "dagshub",
+            "dvclive",
+            "flyte",
+            "mlflow",
+            "neptune",
+            "tensorboard",
+            "wandb",
+            "all",
+            "none",
+        ],
+        help = "The list of integrations to report the results and logs to. Supported platforms are: \n\t\t 'azure_ml', 'clearml', 'codecarbon', 'comet_ml', 'dagshub', 'dvclive', 'flyte', 'mlflow', 'neptune', 'tensorboard', and 'wandb'. Use 'all' to report to all integrations installed, 'none' for no integrations.",
+    )
+    report_group.add_argument(
+        "--logging_steps", type = int, default = 1, help = "Logging steps, default is 1"
+    )
+    report_group.add_argument(
+        "--wandb_entity",
+        type = str,
+        default = None,
+        help = "Wandb entity (username or team name). If not set, uses default from wandb config.",
+    )
+    report_group.add_argument(
+        "--wandb_project",
+        type = str,
+        default = None,
+        help = "Wandb project name. If not set, uses default from wandb config.",
+    )
+    report_group.add_argument(
+        "--wandb_run_name",
+        type = str,
+        default = None,
+        help = "Wandb run name. If not set, wandb auto-generates a name.",
+    )
+
+    # Saving and pushing arguments
+    save_group = parser.add_argument_group("💾 Save Model Options")
+    save_group.add_argument(
+        "--output_dir", type = str, default = "outputs", help = "Output directory"
+    )
+    save_group.add_argument(
+        "--save_model", action = "store_true", help = "Save the model after training"
+    )
+    save_group.add_argument(
+        "--save_method",
+        type = str,
+        default = "merged_16bit",
+        choices = ["merged_16bit", "merged_4bit", "lora"],
+        help = "Save method for the model, default is 'merged_16bit'",
+    )
+    save_group.add_argument(
+        "--save_gguf",
+        action = "store_true",
+        help = "Convert the model to GGUF after training",
+    )
+    save_group.add_argument(
+        "--save_path", type = str, default = "model", help = "Path to save the model"
+    )
+    save_group.add_argument(
+        "--quantization",
+        type = str,
+        default = "q8_0",
+        nargs = "+",
+        help = "Quantization method for saving the model. common values ('f16', 'q4_k_m', 'q8_0'), Check our wiki for all quantization methods https://github.com/unslothai/unsloth/wiki#saving-to-gguf ",
+    )
+
+    push_group = parser.add_argument_group("🚀 Push Model Options")
+    push_group.add_argument(
+        "--push_model",
+        action = "store_true",
+        help = "Push the model to Hugging Face hub after training",
+    )
+    push_group.add_argument(
+        "--push_gguf",
+        action = "store_true",
+        help = "Push the model as GGUF to Hugging Face hub after training",
+    )
+    push_group.add_argument(
+        "--hub_path",
+        type = str,
+        default = "hf/model",
+        help = "Path on Hugging Face hub to push the model",
+    )
+    push_group.add_argument(
+        "--hub_token", type = str, help = "Token for pushing the model to Hugging Face hub"
+    )
+
+    args = parser.parse_args()
+    run(args)
